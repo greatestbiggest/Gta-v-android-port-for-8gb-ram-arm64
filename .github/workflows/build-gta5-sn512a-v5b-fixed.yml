@@ -1,0 +1,415 @@
+name: SN512A GTA V V5b ASTC Build Fix
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      # This workflow can live in the user's separate GitHub repository.
+      # Fetch the correct source explicitly into gta5/.
+      - name: Check out GTA V Android renderer source
+        uses: actions/checkout@v5
+        with:
+          repository: bytarch/gta5mobile-android
+          ref: main
+          path: gta5
+          persist-credentials: false
+      - name: Verify GTA V source files
+        run: |
+          set -euo pipefail
+          test -f gta5/src/gpu.rs
+          sha256sum gta5/src/gpu.rs
+          test -f gta5/Cargo.toml
+          test -d gta5/android
+          echo 'GTA V source checkout found; patch may now be applied.'
+      - name: Patch renderer for SN512A (embedded, one-file workflow)
+        run: |
+          python3 - gta5 <<'SN512A_PY_PATCH'
+          #!/usr/bin/env python3
+          """Apply an experimental peak-memory reduction to bytarch/gta5mobile-android.
+          
+          Run from any directory: python3 apply_sn512a.py /path/to/gta5mobile-android
+          Only alters src/gpu.rs. Makes a backup before editing.
+          """
+          from pathlib import Path
+          import sys
+          import shutil
+          
+          OLD = '''        let mut data = self.bytes(data_addr, size).to_vec();
+                  let mut bpr = bpr;
+                  let mut rows = rows;
+                  if let Some(format) = compressed_source {
+                      match crate::texture::decode(format, &data, w, h, d.max(1), bpr, rows) {
+                          Ok((decoded, pitch)) => { data = decoded; bpr = pitch; rows = h; }
+                          Err(e) => { log_once("bc-decode", &format!("BC upload failed: {e:#}")); return; }
+                      }
+                  }
+                  if a8 {
+                      let mut out = vec![0u8; (w * h * 4) as usize];
+                      for r in 0..h as usize {
+                          for c in 0..w as usize {
+                              out[(r * w as usize + c) * 4 + 3] = data.get(r * bpr as usize + c).copied().unwrap_or(0);
+                          }
+                      }
+                      data = out;
+                      bpr = w * 4;
+                  }
+                  self.queue.write_texture(
+                      TexelCopyTextureInfo { texture: &tex, mip_level: mip, origin: Origin3d { x, y, z: if three { z } else { slice } }, aspect: TextureAspect::All },
+                      &data,
+                      TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rows.max(1)) },
+                      copy_extent(format, w, h, d.max(1)),
+                  );'''
+          
+          NEW = '''        // SN512A memory experiment: upload BC fallback data in 128-row strips.
+                  // Previously a compressed input clone and a full decoded RGBA image
+                  // coexisted, giving large textures a high transient RSS peak. This
+                  // does NOT reduce the final size of resident GPU textures or WASM heap.
+                  if let Some(bc_format) = compressed_source {
+                      let block_bytes = bc_format.block_copy_size(None).unwrap_or(16) as u64;
+                      let block_cols = w.div_ceil(4) as u64;
+                      let block_rows = h.div_ceil(4) as u64;
+                      let min_pitch = match block_cols.checked_mul(block_bytes) {
+                          Some(n) => n,
+                          None => { log_once("bc-stripe-overflow", "BC pitch overflow"); return; }
+                      };
+                      let pitch = if bpr == 0 { min_pitch } else { bpr as u64 };
+                      if pitch < min_pitch || pitch > u32::MAX as u64 {
+                          log_once("bc-stripe-pitch", "BC row pitch invalid");
+                          return;
+                      }
+                      let image_rows = (rows as u64).max(block_rows);
+                      let Some(layer_stride) = pitch.checked_mul(image_rows) else {
+                          log_once("bc-stripe-overflow", "BC layer stride overflow"); return;
+                      };
+                      let Some(min_len) = layer_stride.checked_mul((d.max(1) - 1) as u64)
+                          .and_then(|v| v.checked_add(pitch.saturating_mul(block_rows - 1)))
+                          .and_then(|v| v.checked_add(min_pitch)) else {
+                          log_once("bc-stripe-overflow", "BC input length overflow"); return;
+                      };
+                      let src = self.bytes(data_addr, size);
+                      if min_len > src.len() as u64 {
+                          log_once("bc-stripe-truncated", "BC upload was truncated"); return;
+                      }
+                      for layer in 0..d.max(1) {
+                          for start_y in (0..h).step_by(128) {
+                              let stripe_h = (h - start_y).min(128);
+                              let stripe_blocks = stripe_h.div_ceil(4) as u64;
+                              let begin = layer as u64 * layer_stride + (start_y as u64 / 4) * pitch;
+                              let end = begin + (stripe_blocks - 1) * pitch + min_pitch;
+                              let chunk = &src[begin as usize..end as usize];
+                              let (decoded, decoded_pitch) = match crate::texture::decode(
+                                  bc_format, chunk, w, stripe_h, 1, pitch as u32, stripe_blocks as u32
+                              ) {
+                                  Ok(r) => r,
+                                  Err(e) => { log_once("bc-decode", &format!("BC upload failed: {e:#}")); return; }
+                              };
+                              self.queue.write_texture(
+                                  TexelCopyTextureInfo {
+                                      texture: &tex, mip_level: mip,
+                                      origin: Origin3d { x, y: y + start_y, z: (if three { z } else { slice }) + layer },
+                                      aspect: TextureAspect::All,
+                                  },
+                                  &decoded,
+                                  TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(decoded_pitch), rows_per_image: Some(stripe_h) },
+                                  copy_extent(format, w, stripe_h, 1),
+                              );
+                          }
+                      }
+                      return;
+                  }
+                  // Non-BC uploads can borrow the engine's source bytes instead of
+                  // allocating a second full-sized CPU buffer just to upload them.
+                  let mut data = std::borrow::Cow::<[u8]>::Borrowed(self.bytes(data_addr, size));
+                  let mut bpr = bpr;
+                  if a8 {
+                      let mut out = vec![0u8; (w * h * 4) as usize];
+                      for r in 0..h as usize {
+                          for c in 0..w as usize {
+                              out[(r * w as usize + c) * 4 + 3] = data.get(r * bpr as usize + c).copied().unwrap_or(0);
+                          }
+                      }
+                      data = std::borrow::Cow::Owned(out);
+                      bpr = w * 4;
+                  }
+                  self.queue.write_texture(
+                      TexelCopyTextureInfo { texture: &tex, mip_level: mip, origin: Origin3d { x, y, z: if three { z } else { slice } }, aspect: TextureAspect::All },
+                      &data,
+                      TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rows.max(1)) },
+                      copy_extent(format, w, h, d.max(1)),
+                  );'''
+          
+          # Conservative diagnostics: only new metrics; no resource eviction or changes
+          # to allocator caps until the new logs prove an actual resident-memory saving.
+          OLD_STATS = '''            self.submits0 = self.submits;
+                      self.pending_skips0 = self.pending_skips;'''
+          NEW_STATS = '''            let (bc_count, gpu_decoded, gpu_bc_original) = self.objs.iter()
+                          .filter_map(|o| match o {
+                              Some(Obj::Tex(t)) => t.compressed_source.map(|source| (t, source)),
+                              _ => None,
+                          })
+                          .fold((0u64, 0u64, 0u64), |(count, decoded, original), (t, src)| {
+                              (count + 1,
+                               decoded.saturating_add(texture_bytes_estimate(t.format, t.desc)),
+                               original.saturating_add(texture_bytes_estimate(src, t.desc)))
+                          });
+                      log(&format!("bc fallback estimate: {} textures; GPU decoded ~{} MiB, native-BC-sized ~{} MiB (estimates, not extra RAM)",
+                          bc_count, gpu_decoded >> 20, gpu_bc_original >> 20));
+                      self.submits0 = self.submits;
+                      self.pending_skips0 = self.pending_skips;'''
+          
+          OLD_HELPER = 'static START: LazyLock<Instant> = LazyLock::new(Instant::now);'
+          NEW_HELPER = '''// Texture storage estimation for comparing later ASTC/ETC2 experiments.
+          // Includes mips and array layers; does not imply these are CPU RSS bytes.
+          fn texture_bytes_estimate(format: TextureFormat, desc: TexDesc) -> u64 {
+              let (bw, bh) = format.block_dimensions();
+              let block_size = format.block_copy_size(None).unwrap_or(4) as u64;
+              let mut total = 0u64;
+              for mip in 0..desc.mips {
+                  let shift = mip.min(31);
+                  let width = (desc.w >> shift).max(1) as u64;
+                  let height = (desc.h >> shift).max(1) as u64;
+                  let layers = if desc.dim == TextureDimension::D3 {
+                      (desc.d >> shift).max(1) as u64
+                  } else {
+                      desc.d as u64
+                  };
+                  let blocks = width.div_ceil(bw.max(1) as u64)
+                      .saturating_mul(height.div_ceil(bh.max(1) as u64));
+                  total = total.saturating_add(blocks.saturating_mul(layers)
+                      .saturating_mul(block_size).saturating_mul(desc.samples as u64));
+              }
+              total
+          }
+          static START: LazyLock<Instant> = LazyLock::new(Instant::now);'''
+          
+          REPLACEMENTS = [(OLD, NEW), (OLD_STATS, NEW_STATS), (OLD_HELPER, NEW_HELPER)]
+          
+          def transform(s: str) -> str:
+              for old, new in REPLACEMENTS:
+                  n = s.count(old)
+                  if n != 1:
+                      raise RuntimeError(f"Upstream source mismatch (expected exactly 1 match, got {n}) near {old[:60]!r}. No output written.")
+                  s = s.replace(old, new, 1)
+              return s
+          
+          def main() -> None:
+              if len(sys.argv) != 2:
+                  raise SystemExit('Usage: python3 apply_sn512a.py /path/to/gta5mobile-android')
+              file = Path(sys.argv[1]) / 'src' / 'gpu.rs'
+              if not file.exists():
+                  raise SystemExit(f'Missing source file: {file}')
+              original = file.read_text()
+              if 'SN512A memory experiment' in original:
+                  raise SystemExit('This patch is already applied.')
+              updated = transform(original)
+              backup = file.with_suffix('.rs.sn512a-original')
+              shutil.copy2(file, backup)
+              file.write_text(updated)
+              print(f'Patched {file}; original backed up to {backup}')
+              print('STATUS: Source modified. Not compiled; not validated on SN512A.')
+              print('Next: ./make-android.sh (requires full Android + Rust toolchains)')
+          
+          if __name__ == '__main__':
+              main()
+          SN512A_PY_PATCH
+      # V5 replaces the V4 small-cache experiment. The new renderer path uses
+      # native ASTC 4x4 for a restricted subset of sampled BC textures.
+      - name: Apply corrected V5b ASTC resident-memory experiment
+        run: |
+          cat > /tmp/sn512a_v5.py <<'SN512A_V5_SOURCE'
+          #!/usr/bin/env python3
+          """Experimental V5b: bounded decoded-BC uploads to hardware-compressed ASTC 4x4.
+          Run AFTER V1 patch in a fresh bytarch/gta5mobile-android checkout.
+          
+          Uses constant-color void-extent ASTC blocks (averaged 4x4 source texels).
+          This is a deliberately low-quality memory-footprint proof of concept,
+          NOT a production-quality BC -> ASTC transcoder. No claim of device validation.
+          """
+          from pathlib import Path
+          import sys
+          
+          HELPER = r'''// SN512A V5b: simple ASTC 4x4 constant-colour proof of concept.
+          // Each 4x4 block stores one average colour, sacrificing detail. This is NOT
+          // full-quality ASTC encoding. It is low-memory and fast enough for streaming,
+          // and an optional first experiment before adding offline high-quality caching.
+          fn sn512a_astc_4x4_avg(rgba: &[u8], w: u32, h: u32, pitch: u32) -> Vec<u8> {
+              let blocks_w = w.div_ceil(4);
+              let blocks_h = h.div_ceil(4);
+              let mut out = Vec::with_capacity((blocks_w as usize).saturating_mul(blocks_h as usize).saturating_mul(16));
+              for by in 0..blocks_h {
+                  for bx in 0..blocks_w {
+                      let mut sum = [0u32; 4];
+                      let mut n = 0u32;
+                      for yy in by * 4..(by * 4 + 4).min(h) {
+                          for xx in bx * 4..(bx * 4 + 4).min(w) {
+                              let i = yy as usize * pitch as usize + xx as usize * 4;
+                              for c in 0..4 { sum[c] += rgba[i + c] as u32; }
+                              n += 1;
+                          }
+                      }
+                      // Khronos ASTC LDR void-extent encoding. Header bits follow the
+                      // ASTC reference encoder's standard constant UNORM16 block.
+                      out.extend_from_slice(&[0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+                      for v in sum {
+                          let c = ((v + n / 2) / n) as u8;
+                          out.extend_from_slice(&[c, c]);
+                      }
+                  }
+              }
+              out
+          }
+          fn sn512a_astc_fmt(source: TextureFormat) -> TextureFormat {
+              TextureFormat::Astc {
+                  block: AstcBlock::B4x4,
+                  channel: if source.is_srgb() { AstcChannel::UnormSrgb } else { AstcChannel::Unorm },
+              }
+          }
+          fn sn512a_astc_enabled(format: TextureFormat) -> bool {
+              matches!(format, TextureFormat::Astc { block: AstcBlock::B4x4, .. })
+          }
+          '''
+          
+          # Match source points against the existing V1 patch, not against V4's cache experiment.
+          old_fallback = '''        if unsupported_bc {
+                      m.format = crate::texture::fallback_format(m.format);
+                      m.views = match m.format {
+                          TextureFormat::Rgba8Unorm => vec![TextureFormat::Rgba8UnormSrgb],
+                          TextureFormat::Rgba8UnormSrgb => vec![TextureFormat::Rgba8Unorm],
+                          _ => vec![],
+                      };
+                  }'''
+          new_fallback = '''        if unsupported_bc {
+                      // SN512A V5b: ONLY static 2D BC1/2/3/7 sampled colour textures.
+                      // Retain the original CPU fallback for BC4/5 normals, BC6 HDR,
+                      // 3D, non-block-aligned, and render-target/storage textures.
+                      let astc_eligible = self.device.features().contains(Features::TEXTURE_COMPRESSION_ASTC)
+                          && dim == 2 && w >= 4 && h >= 4 && w % 4 == 0 && h % 4 == 0
+                          && samples <= 1 && bind & (BIND_RT | BIND_DS | BIND_UAV) == 0
+                          && matches!(m.format,
+                              TextureFormat::Bc1RgbaUnorm | TextureFormat::Bc1RgbaUnormSrgb |
+                              TextureFormat::Bc2RgbaUnorm | TextureFormat::Bc2RgbaUnormSrgb |
+                              TextureFormat::Bc3RgbaUnorm | TextureFormat::Bc3RgbaUnormSrgb |
+                              TextureFormat::Bc7RgbaUnorm | TextureFormat::Bc7RgbaUnormSrgb);
+                      if astc_eligible {
+                          let original = m.format;
+                          m.format = sn512a_astc_fmt(original);
+                          // SRGB reinterpretation remains available where supported.
+                          m.views = vec![sn512a_astc_fmt(if original.is_srgb() {
+                              TextureFormat::Bc1RgbaUnorm
+                          } else {
+                              TextureFormat::Bc1RgbaUnormSrgb
+                          })];
+                      } else {
+                          m.format = crate::texture::fallback_format(m.format);
+                          m.views = match m.format {
+                              TextureFormat::Rgba8Unorm => vec![TextureFormat::Rgba8UnormSrgb],
+                              TextureFormat::Rgba8UnormSrgb => vec![TextureFormat::Rgba8Unorm],
+                              _ => vec![],
+                          };
+                      }
+                  }'''
+          
+          old_upload = '                    self.queue.write_texture(\n                        TexelCopyTextureInfo {\n                            texture: &tex, mip_level: mip,\n                            origin: Origin3d { x, y: y + start_y, z: (if three { z } else { slice }) + layer },\n                            aspect: TextureAspect::All,\n                        },\n                        &decoded,\n                        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(decoded_pitch), rows_per_image: Some(stripe_h) },\n                        copy_extent(format, w, stripe_h, 1),\n                    );'
+          new_upload = '                    // SN512A V5b: encode a bounded 128-row decoded BC stripe\n                    // into 16-byte ASTC 4x4 constant-color blocks when supported.\n                    let (payload, upload_pitch, upload_rows) = if sn512a_astc_enabled(format) {\n                        (sn512a_astc_4x4_avg(&decoded, w, stripe_h, decoded_pitch),\n                         w.div_ceil(4) * 16, stripe_h.div_ceil(4))\n                    } else {\n                        (decoded, decoded_pitch, stripe_h)\n                    };\n                    self.queue.write_texture(\n                        TexelCopyTextureInfo {\n                            texture: &tex, mip_level: mip,\n                            origin: Origin3d { x, y: y + start_y, z: (if three { z } else { slice }) + layer },\n                            aspect: TextureAspect::All,\n                        },\n                        &payload,\n                        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(upload_pitch), rows_per_image: Some(upload_rows) },\n                        copy_extent(format, w, stripe_h, 1),\n                    );'
+          
+          old_view = '            let mf = if decoded_bc { crate::texture::fallback_format(mf) } else { mf };'
+          new_view = '''            let mf = if decoded_bc {
+                          if sn512a_astc_enabled(format) { sn512a_astc_fmt(mf) }
+                          else { crate::texture::fallback_format(mf) }
+                      } else { mf };'''
+          
+          old_stats = '            log(&format!("bc fallback estimate: {} textures; GPU decoded ~{} MiB, native-BC-sized ~{} MiB (estimates, not extra RAM)",\n                bc_count, gpu_decoded >> 20, gpu_bc_original >> 20));'
+          new_stats = '            let astc_count = self.objs.iter().filter(|o| matches!(o,\n                Some(Obj::Tex(t)) if sn512a_astc_enabled(t.format))).count();\n            log(&format!("SN512A V5b: {} BC-source textures; {} compressed ASTC 4x4; estimated resident GPU-format storage ~{} MiB vs source BC ~{} MiB (not process RSS)",\n                bc_count, astc_count, gpu_decoded >> 20, gpu_bc_original >> 20));'
+          
+          def replace_once(source, old, new, label):
+              count = source.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected exactly one target, got {count}; upstream code changed, no write')
+              return source.replace(old, new, 1)
+          
+          def transform(source):
+              if 'SN512A memory experiment' not in source or 'bc fallback estimate:' not in source:
+                  raise RuntimeError('This patch requires the V1 texture stripes and diagnostics first')
+              source = replace_once(source, '// Texture storage estimation for comparing later ASTC/ETC2 experiments.', HELPER + '\n// Texture storage estimation for comparing later ASTC/ETC2 experiments.', 'helper')
+              source = replace_once(source, 'let want = Features::TEXTURE_COMPRESSION_BC |', 'let want = Features::TEXTURE_COMPRESSION_ASTC | Features::TEXTURE_COMPRESSION_BC |', 'device features')
+              source = replace_once(source, old_fallback, new_fallback, 'native ASTC texture creation')
+              source = replace_once(source, old_upload, new_upload, 'native ASTC uploads')
+              source = replace_once(source, old_view, new_view, 'sRGB view translation')
+              source = replace_once(source, old_stats, new_stats, 'resident storage diagnostics')
+              return source
+          
+          def main():
+              if len(sys.argv) != 2:
+                  raise SystemExit('usage: python3 gta5_sn512a_v5_astc_patch.py /path/to/gta5-checkout')
+              p = Path(sys.argv[1]) / 'src' / 'gpu.rs'
+              old = p.read_text()
+              new = transform(old)
+              p.with_suffix('.rs.before_v5').write_text(old)
+              p.write_text(new)
+              print('SN512A V5b source patch applied. The ASTC output is LOW-QUALITY (4x4 per-block average).')
+              print('Must build, install, validate texture rendering, and profile RSS. Do not claim crashes fixed.')
+          
+          if __name__ == '__main__':
+              main()
+          SN512A_V5_SOURCE
+          python3 /tmp/sn512a_v5.py gta5
+          echo 'ASTC source transform succeeded; next step verifies markers.'
+      - name: Audit native ASTC features and texture memory path
+        run: |
+          set -euo pipefail
+          grep -Fq 'Features::TEXTURE_COMPRESSION_ASTC | Features::TEXTURE_COMPRESSION_BC' gta5/src/gpu.rs
+          grep -Fq 'sn512a_astc_4x4_avg(&decoded' gta5/src/gpu.rs
+          grep -Fq 'SN512A V5b:' gta5/src/gpu.rs
+          grep -Fq 'let astc_eligible =' gta5/src/gpu.rs
+          echo 'V5 source markers verified. Not a runtime stability test.'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install Android SDK and NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'platform-tools'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sn512a-gta5-arm64-v5b
+          workspaces: gta5 -> target
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Prepare NDK environment
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - name: Optional persistent signing key
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE" ]; then
+            printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/keystore.jks" >> "$GITHUB_ENV"
+          else
+            echo 'No signing secret: new debug key; upgrade over existing install may fail.'
+          fi
+      - name: Build APK
+        working-directory: gta5
+        run: gradle -p android testDebugUnitTest assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v5
+        with:
+          name: GTA5-SN512A-V5b-ASTC-LOWQUALITY-UNVERIFIED
+          path: gta5/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
