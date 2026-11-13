@@ -1,0 +1,238 @@
+name: SN512A GTA V - V7 V5b Binary Memory Hotpath (experimental)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Successful V5b original build run ID"
+        required: true
+        type: string
+        default: "42181697871"
+      slack_mib:
+        description: "Extra Wasmtime heap-growth allowance (MiB), formerly 96"
+        required: true
+        type: choice
+        options:
+          - "16"
+          - "32"
+          - "96"
+        default: "16"
+      quiet_refusals:
+        description: "Skip logging repeated rejected heap-growth diagnostics (reduces log flood; DOES NOT change allocation result)"
+        required: true
+        type: choice
+        options: 
+          - "yes"
+          - "no"
+        default: "yes"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  experimental-binary-patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out OUR files (no developer repository needed)
+        uses: actions/checkout@v4
+      - name: Recover exact successful V5b build artifact from OUR earlier run
+        uses: actions/download-artifact@v5
+        with:
+          name: GTA5-SN512A-V5b-ASTC-LOWQUALITY-UNVERIFIED
+          run-id: ${{ inputs.source_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: upstream-v5b-apk
+      - name: Patch checked ARM64 heap-growth hotpath and avoid repeated refused-growth log flood
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find upstream-v5b-apk -type f -name '*.apk' -print -quit)
+          test -n "$APK" || { echo 'Could not find V5b APK artifact'; exit 1; }
+          mkdir -p unsigned reports output
+          cat > /tmp/sn512a_patch.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """SN512A V5b ARM64 native code patch: experimental host memory adjustments.
+
+          Reproducible, fail-closed patch that works on the EXACT recovered V5b APK.
+          This does not alter GTA V's internal asset streaming budget, its game.wasm,
+          or GPU memory residency. Code patches are narrow and independently verified.
+          """
+          import argparse
+          import copy
+          import hashlib
+          import json
+          import struct
+          import zipfile
+          from pathlib import Path
+
+          APK_SHA = "8cde7eee5ca0c25a84d9edb146cf6f8bd8daebd1af539d00dac4d3c25adf15b6"
+          LIB_SHA = "84d157c8bf80d79940fb58fdf5a5b23fa22429e1943bdce4a86ac7c62efbab18"
+          LIB = "lib/arm64-v8a/libmuguet.so"
+
+          # Verified in V5b: spare Wasmtime memory-growth allowance (96 MiB) in three paths.
+          SLACK_SITES = ((0x524B10, "09c0a052"), (0x524BB8, "0ac0a052"), (0x524C54, "0ac0a052"))
+
+          # x20 > x21 (requested heap beyond hard cap) enters the Rust diagnostic formatter
+          # at 0x524AC0; at 0x524B00 the function returns false. Replace only its first
+          # instruction with B 0x524B00, avoiding an expensive heap-allocated/logged string
+          # each time while PRESERVING the failed-growth result and max cap comparison.
+          # The user's 3-GiB session emitted ~1.13 million refused-growth messages.
+          REJECT_LOG_START_VA = 0x524AC0
+          REJECT_RETURN_VA = 0x524B00
+          REJECT_ORIGINAL = bytes.fromhex("08fc54d3")  # lsr x8, x0, #20
+
+
+          def sha(b: bytes) -> str:
+              return hashlib.sha256(b).hexdigest()
+
+
+          def code_at(va: int) -> int:
+              return va - 0x4000  # Verified original V5b .text virtual-address/file-offset delta
+
+
+          def write_check(b: bytearray, va: int, expected: bytes, replacement: bytes, changes: list, what: str):
+              off = code_at(va)
+              old = bytes(b[off:off+len(expected)])
+              if old != expected:
+                  raise ValueError(f"Unexpected ARM64 instruction at {va:#x}: {old.hex()} expected {expected.hex()}")
+              if len(replacement) != len(expected):
+                  raise ValueError("Patch would change ELF size")
+              b[off:off+len(expected)] = replacement
+              changes.append(dict(name=what, va=hex(va), file_offset=hex(off), before=old.hex(), after=replacement.hex()))
+
+
+          def patch(lib: bytes, slack_mib: int, silence_refused: bool):
+              if sha(lib) != LIB_SHA:
+                  raise ValueError(f"V5b library hash mismatch; refusing to modify unknown build: {sha(lib)}")
+              if slack_mib not in (16, 32, 96):
+                  raise ValueError("Expected 16, 32 or 96 MiB growth slack")
+              out = bytearray(lib)
+              changes = []
+              if slack_mib != 96:
+                  for va, orig_hex in SLACK_SITES:
+                      orig = bytes.fromhex(orig_hex)
+                      orig_word, = struct.unpack('<I', orig)
+                      if orig_word & 0xFFFFFC00 != 0x52a0c000:
+                          raise ValueError(f"Not a verified MOVZ slack instruction: {va:#x}")
+                      reg = orig_word & 31
+                      # MOVZ Wreg, #0x100 (16 MiB, LSL 16) or #0x200 (32 MiB).
+                      new_word = {16: 0x52a02000, 32: 0x52a04000}[slack_mib] | reg
+                      write_check(out, va, orig, struct.pack('<I', new_word), changes,
+                                  f'host extra-growth slack 96 -> {slack_mib} MiB')
+              if silence_refused:
+                  delta = REJECT_RETURN_VA - REJECT_LOG_START_VA
+                  if delta % 4 or not (-2**27 <= delta < 2**27):
+                      raise ValueError("Cannot encode branch")
+                  # AArch64 B imm26 immediate is PC-relative in units of 4 bytes.
+                  branch = struct.pack('<I', 0x14000000 | ((delta//4)&0x03FFFFFF))
+                  write_check(out, REJECT_LOG_START_VA, REJECT_ORIGINAL, branch,
+                              changes, 'skip repetitive diagnostics ONLY on a rejected heap-growth attempt')
+              if len(out) != len(lib) or out[:4] != b'\x7fELF':
+                  raise ValueError('Invalid patched ELF')
+              if sum(x != y for x, y in zip(lib, out)) > 16:
+                  raise ValueError('Unexpected number of modified bytes')
+              return bytes(out), changes
+
+
+          def patch_apk(apk_path: Path, out_path: Path, report: Path, slack: int, quiet: bool):
+              raw = apk_path.read_bytes()
+              if sha(raw) != APK_SHA:
+                  raise ValueError(f'Wrong V5b APK; SHA={sha(raw)} expected={APK_SHA}')
+              with zipfile.ZipFile(apk_path) as zin:
+                  if zin.testzip() is not None:
+                      raise ValueError('Corrupt original APK')
+                  oldlib = zin.read(LIB)
+                  newlib, changes = patch(oldlib, slack, quiet)
+                  out_path.parent.mkdir(exist_ok=True, parents=True)
+                  with zipfile.ZipFile(out_path, 'w') as zout:
+                      zout.comment = zin.comment
+                      for info in zin.infolist():
+                          data = newlib if info.filename == LIB else zin.read(info.filename)
+                          zout.writestr(copy.copy(info), data, compress_type=info.compress_type)
+                  with zipfile.ZipFile(out_path) as check:
+                      if check.testzip() is not None or check.read(LIB) != newlib:
+                          raise ValueError('Failed APK write verification')
+                      for info in zin.infolist():
+                          if info.filename != LIB and check.read(info.filename) != zin.read(info.filename):
+                              raise ValueError('Unexpected APK member changed: ' + info.filename)
+              payload = {
+                  'status': 'EXPERIMENT ONLY; no phone or stability validation',
+                  'source_apk_sha256': sha(raw), 'source_native_sha256': sha(oldlib),
+                  'patched_native_sha256': sha(newlib), 'patched_unsigned_apk_sha256': sha(out_path.read_bytes()),
+                  'slack_mib': slack, 'skip_repeated_heap_refusal_log': quiet,
+                  'changes': changes,
+                  'unchanged': 'Heap maximum checking, ASTC V5b renderer, game.wasm and actual asset streaming lifecycle',
+                  'important': 'The app may STILL be killed by Android LOW_MEMORY. The log patch does not change memory.grow outcomes.'}
+              report.parent.mkdir(parents=True, exist_ok=True)
+              report.write_text(json.dumps(payload, indent=2) + '\n')
+              return payload
+
+
+          def main():
+              p = argparse.ArgumentParser(description=__doc__)
+              p.add_argument('--apk', type=Path, required=True)
+              p.add_argument('--output', type=Path, required=True)
+              p.add_argument('--report', type=Path, required=True)
+              p.add_argument('--slack-mib', type=int, choices=(16,32,96), default=16)
+              p.add_argument('--quiet-refusals', action='store_true')
+              a = p.parse_args()
+              print(json.dumps(patch_apk(a.apk,a.output,a.report,a.slack_mib,a.quiet_refusals),indent=2))
+
+
+          if __name__ == '__main__':
+              main()
+          PYEOF
+          python3 /tmp/sn512a_patch.py \
+            --apk "$APK" \
+            --output unsigned/SN512A-V5b-V7-${{ inputs.slack_mib }}MiB-unsigned.apk \
+            --report reports/patch-report.json \
+            --slack-mib '${{ inputs.slack_mib }}' \
+            ${{ inputs.quiet_refusals == 'yes' && '--quiet-refusals' || '' }}
+      - name: Get Android build tools for zipalign and APK signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          if [ ! -x "$ANDROID_HOME/build-tools/35.0.0/apksigner" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'build-tools;35.0.0'
+          fi
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -h >/dev/null 2>&1 || true
+      - name: Align and SIGN the experimental APK (new debug key)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/build-tools/35.0.0"
+          RAW="unsigned/SN512A-V5b-V7-${{ inputs.slack_mib }}MiB-unsigned.apk"
+          "$BT/zipalign" -P 16 -f 4 "$RAW" output/aligned-unsigned.apk
+          "$BT/zipalign" -c -P 16 -v 4 output/aligned-unsigned.apk
+          # Ephemeral debug certificate: existing V5b usually must be UNINSTALLED first.
+          keytool -genkeypair -noprompt -keystore "${RUNNER_TEMP}/sn512a-experiment.p12" \
+            -storetype PKCS12 -alias sn512a-experiment \
+            -storepass android -keypass android -keyalg RSA -keysize 3072 \
+            -validity 3650 -dname 'CN=SN512A Memory Experiment, O=Local Debug'
+          "$BT/apksigner" sign \
+            --ks "${RUNNER_TEMP}/sn512a-experiment.p12" \
+            --ks-key-alias sn512a-experiment \
+            --ks-pass pass:android --key-pass pass:android \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            --out "output/GTA5-SN512A-V7-HOTPATH-${{ inputs.slack_mib }}MiB-UNTESTED.apk" \
+            output/aligned-unsigned.apk
+          "$BT/apksigner" verify --verbose --print-certs "output/GTA5-SN512A-V7-HOTPATH-${{ inputs.slack_mib }}MiB-UNTESTED.apk" \
+             | tee reports/signature-check.txt
+          sha256sum "output/GTA5-SN512A-V7-HOTPATH-${{ inputs.slack_mib }}MiB-UNTESTED.apk" \
+             | tee reports/experimental-apk-sha256.txt
+          rm output/aligned-unsigned.apk
+      - name: Upload signed experimental APK and audit (NOT a memory crash fix)
+        uses: actions/upload-artifact@v5
+        with:
+          name: GTA5-SN512A-V7-HOTPATH-${{ inputs.slack_mib }}MiB-UNTESTED
+          path: |
+            output/*.apk
+            reports/*
+          if-no-files-found: error
+          retention-days: 90

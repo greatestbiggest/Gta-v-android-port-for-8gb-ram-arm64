@@ -1,0 +1,81 @@
+name: SN512A GTA V - Recover Our V5b APK (no upstream checkout)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Successful V5b run ID containing our already-built APK'
+        required: true
+        default: '42181697871'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out OUR repository (workflow and patches only)
+        uses: actions/checkout@v4
+
+      - name: Retrieve OUR successful V5b APK (no BytArch checkout)
+        uses: actions/download-artifact@v5
+        with:
+          name: GTA5-SN512A-V5b-ASTC-LOWQUALITY-UNVERIFIED
+          run-id: ${{ inputs.source_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: v5b-original-artifact
+
+      - name: Validate APK, inventory ARM64 binaries, and preserve patch workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p recovered/patch-workflows recovered/native-libraries
+          APK="$(find v5b-original-artifact -type f -name '*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo 'No APK in the V5b artifact. This workflow cannot recover source code from an APK.' >&2
+            exit 1
+          fi
+          unzip -t "$APK" >/dev/null
+          unzip -Z1 "$APK" > recovered/apk-contents.txt
+          grep -q '^AndroidManifest.xml$' recovered/apk-contents.txt
+          grep -q '^lib/arm64-v8a/.*\.so$' recovered/apk-contents.txt
+          cp "$APK" recovered/GTA5-SN512A-V5b-RECOVERED.apk
+          sha256sum recovered/GTA5-SN512A-V5b-RECOVERED.apk > recovered/apk-sha256.txt
+          while IFS= read -r lib; do
+            case "$lib" in
+              lib/arm64-v8a/*.so)
+                unzip -p "$APK" "$lib" > "recovered/native-libraries/$(basename "$lib")"
+                ;;
+            esac
+          done < recovered/apk-contents.txt
+          for lib in recovered/native-libraries/*.so; do
+            echo "=== $lib ===" >> recovered/elf-audit.txt
+            file "$lib" >> recovered/elf-audit.txt
+            readelf -h "$lib" 2>&1 | grep -E 'Class:|Machine:|Type:' >> recovered/elf-audit.txt || true
+            sha256sum "$lib" >> recovered/native-library-sha256.txt
+          done
+          cp .github/workflows/*.yml recovered/patch-workflows/ 2>/dev/null || true
+          cp .github/workflows/*.yaml recovered/patch-workflows/ 2>/dev/null || true
+          cat > recovered/STATUS.txt <<'STATUS'
+          RECOVERED: Our successful V5b Android APK, native ARM64 libraries,
+          APK inventory/checksums, and available GitHub patch workflows.
+
+          This is NOT a V6 APK and no memory-management changes were made here.
+          The V5b APK is compiled. It cannot be recompiled as editable Rust source.
+          For new ASTC 8x8 or streaming-code changes, recover a complete source
+          checkout/snapshot or implement and validate an independent binary patch.
+          STATUS
+          echo 'Recovery succeeded. The previous APK has been copied without modification.'
+
+      - name: Upload our recovered V5b build and audit
+        uses: actions/upload-artifact@v5
+        with:
+          name: GTA5-SN512A-OUR-V5b-RECOVERED-BUILD
+          path: recovered/
+          if-no-files-found: error
+          retention-days: 90

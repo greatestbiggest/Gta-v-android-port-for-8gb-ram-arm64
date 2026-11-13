@@ -1,0 +1,131 @@
+# Experimental SN512A 768 MiB STREAMING resource-heap test, using GLUE 5.
+# Important: GLUE 5 is a different runtime from the existing BytArch/V5b/V7 APK.
+# The special behavior works because GLUE 5 ALREADY hooks the RAGE buddy allocator.
+# It is NOT safe to simulate this by capping WebAssembly memory to 768 MiB.
+#
+# Private game data: attach your own matching game.wasm to a DRAFT RELEASE in
+# this repository, NEVER commit it or publish it. The APK goes back into that draft.
+name: SN512A GTA V V8 - GLUE5 768MiB Streaming Budget (experimental)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sn512a-v8-glue5-android
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: glue5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}/glue5
+      MISE_TASK_RUN_AUTO_INSTALL: 'false'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out our workflow repository (never includes game.wasm)
+        uses: actions/checkout@v4
+        with:
+          path: user-repo
+          persist-credentials: false
+      - name: Check out GLUE 5 source for its actual memory-budget hooks
+        uses: actions/checkout@v4
+        with:
+          repository: mempage4k/glue5
+          ref: main
+          path: glue5
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify low-memory streaming budget and force 768 MiB for this SN512A test
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          imports = Path('crates/glue5-runtime/src/imports.rs')
+          mem = Path('crates/glue5-runtime/src/memory.rs')
+          old = imports.read_text()
+          hook = mem.read_text()
+          expected = 'None if name == "gameResourceMB" && low => default.min(768),'
+          replacement = 'None if name == "gameResourceMB" => 768,'
+          if old.count(expected) != 1:
+              raise SystemExit('GLUE5 upstream changed gameResourceMB handling; refusing unverified build.')
+          required = (
+              'pub(crate) fn budget_resource_heap(mb: u32)',
+              'pub(crate) unsafe extern "C" fn grow_heap(',
+              'pub(crate) unsafe extern "C" fn memory_available(',
+              'pub(crate) unsafe extern "C" fn largest_block(',
+              'hooks.grow_heap = Some(grow_heap);',
+              'hooks.memory_available = Some(memory_available);',
+              'hooks.largest_block = Some(largest_block);',
+          )
+          missing = [s for s in required if s not in hook]
+          if missing:
+              raise SystemExit('GLUE5 streaming-memory enforcement hooks missing: ' + repr(missing))
+          if 'crate::memory::budget_resource_heap(value)' not in old:
+              raise SystemExit('GLUE5 no longer connects the gameResourceMB value to heap budget.')
+          imports.write_text(old.replace(expected, replacement, 1))
+          assert imports.read_text().count(replacement) == 1
+          print('V8/source verified: Android gameResourceMB=768 MiB; RAGE streaming budget hooks available.')
+          print('The hooks intercept availability checks and allow necessary allocation growth.')
+          PY
+          git diff --check
+          git diff -- crates/glue5-runtime/src/imports.rs
+          sha256sum crates/glue5-runtime/src/imports.rs | tee "$RUNNER_TEMP/glue5_v8_memory_patch_sha256.txt"
+      - name: Retrieve YOUR supported game.wasm from YOUR PRIVATE DRAFT release
+        id: game
+        run: |
+          set -euo pipefail
+          game="$RUNNER_TEMP/game"
+          .github/scripts/draft.sh fetch "$game"
+          echo "GLUE5_GAME_DIR=$game" >> "$GITHUB_ENV"
+      - name: Make room on runner
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Install official GLUE 5 Android build toolchain
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca
+        with:
+          version: 2026.7.5
+          install: false
+          cache_key_prefix: sn512a-v8-glue5-768
+      - name: Install tools from GLUE 5 project config
+        run: |
+          set -euo pipefail
+          mise install rust cmake java gradle android-sdk cargo:cargo-ndk
+      - name: Set up release signing key (preserve it for future updates)
+        run: |
+          set -euo pipefail
+          yes | mise exec -- sdkmanager --licenses >/dev/null || true
+          mkdir -p ~/.android
+          echo "ANDROID_USER_HOME=$HOME/.android" >> "$GITHUB_ENV"
+          cd ~/.android
+          "$GITHUB_WORKSPACE/glue5/.github/scripts/draft.sh" get '${{ steps.game.outputs.release }}' Glue5-android.keystore
+          if [ -f Glue5-android.keystore ]; then
+            mv Glue5-android.keystore debug.keystore
+          else
+            mise -C "$GITHUB_WORKSPACE/glue5" exec -- keytool -genkeypair -noprompt \
+              -keystore debug.keystore -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname 'CN=SN512A V8 Debug,O=Android,C=US'
+          fi
+      - name: Compile GLUE 5 Android AOT game and app
+        run: |
+          set -euo pipefail
+          mise run android:build
+          test -s target/android/gradle/outputs/apk/release/Glue5-release.apk
+          cp target/android/gradle/outputs/apk/release/Glue5-release.apk "$RUNNER_TEMP/Glue5-android.apk"
+          cp ~/.android/debug.keystore "$RUNNER_TEMP/Glue5-android.keystore"
+          sha256sum "$RUNNER_TEMP/Glue5-android.apk"
+      - name: Keep signed test APK private in the SAME DRAFT release
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/glue5/.github/scripts/draft.sh" upload '${{ steps.game.outputs.release }}' Glue5-android.apk Glue5-android.keystore
+          echo 'V8 GLUE5 768 MiB build uploaded to your PRIVATE DRAFT RELEASE. Keep it draft. Android physical-device stability remains unverified.' >> "$GITHUB_STEP_SUMMARY"

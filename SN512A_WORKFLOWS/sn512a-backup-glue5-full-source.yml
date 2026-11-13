@@ -1,0 +1,142 @@
+# Preserve a self-contained GLUE 5 source snapshot in YOUR GitHub repository.
+# - Downloads public GLUE 5 source + WABT submodule (not GTA V game files).
+# - Saves a ZIP, checksums, Git bundle, and exact upstream commit information.
+# - Tries to mirror a working-tree snapshot to a separate branch in YOUR repo.
+# - Never reads game.wasm, your private draft releases, or Android game data.
+name: SN512A - Backup GLUE 5 full source
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "GLUE 5 commit SHA, tag, or branch to preserve (main for current upstream)"
+        required: true
+        type: string
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    name: Download and independently preserve GLUE 5 source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out our project workflow files
+        uses: actions/checkout@v4
+        with:
+          path: our-project
+          persist-credentials: false
+
+      - name: Check out complete GLUE 5 source with its submodules
+        uses: actions/checkout@v4
+        with:
+          repository: mempage4k/glue5
+          ref: ${{ inputs.source_ref }}
+          path: glue5-upstream
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Inspect and package actual code and build instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f glue5-upstream/Cargo.toml
+          test -f glue5-upstream/Cargo.lock
+          test -f glue5-upstream/LICENSE
+          test -f glue5-upstream/crates/glue5-runtime/src/memory.rs
+          test -f glue5-upstream/crates/glue5-runtime/src/imports.rs
+          test -f glue5-upstream/crates/glue5-gpu/Cargo.toml
+          test -f glue5-upstream/platform/android/gradle.properties
+          test -f glue5-upstream/third_party/wabt/CMakeLists.txt
+
+          mkdir -p backup/snapshot/GLUE5_SOURCE backup/snapshot/SN512A_WORKFLOWS backup/archives
+          # Include complete working tree and checked-out WABT source, not .git metadata.
+          rsync -a --exclude='.git' --exclude='target/' --exclude='node_modules/' \
+            glue5-upstream/ backup/snapshot/GLUE5_SOURCE/
+          if test -d our-project/.github/workflows; then
+            rsync -a --include='*/' --include='*.yml' --include='*.yaml' --exclude='*' \
+              our-project/.github/workflows/ backup/snapshot/SN512A_WORKFLOWS/
+          fi
+
+          # No copyrighted game binaries, game data or signing secrets in backups.
+          if find backup/snapshot -type f \( -iname 'game.wasm' -o -iname '*.rpf' \
+              -o -iname '*.apk' -o -iname '*.keystore' -o -iname '*.jks' \) | grep -q .; then
+            echo 'ERROR: snapshot contains an unexpected game binary or secret-like file.' >&2
+            exit 1
+          fi
+          commit="$(git -C glue5-upstream rev-parse HEAD)"
+          printf '%s\n' "$commit" > backup/GLUE5_UPSTREAM_COMMIT.txt
+          git -C glue5-upstream submodule status --recursive > backup/GLUE5_SUBMODULE_COMMITS.txt
+          cat > backup/snapshot/READ_ME_FIRST.txt <<EOF
+          SN512A GLUE 5 SOURCE BACKUP
+          ==============================================
+          Original: https://github.com/mempage4k/glue5
+          Source commit: $commit
+          Captured (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Source tree: GLUE5_SOURCE/ (including third_party/wabt)
+          Our build customizations: SN512A_WORKFLOWS/
+
+          This archive includes GLUE 5's public source, patches, configs, docs,
+          Android build project, source licenses and our saved GitHub workflows.
+          The V8/V8.1/V8.2 runtime patches are applied BY the workflows at build
+          time; this is an upstream checkout plus the workflows, not a compiled
+          patched APK. Save BOTH the ZIP and git bundle.
+          This backup contains NO game.wasm, GTA V data, APK, credentials,
+          GitHub secrets, toolchains or third-party fetched build caches.
+          Some third-party sources are downloaded by GLUE 5's setup process.
+          GPL-3.0 and third-party license/attribution terms still apply.
+          EOF
+          cp backup/GLUE5_UPSTREAM_COMMIT.txt backup/snapshot/
+          cp backup/GLUE5_SUBMODULE_COMMITS.txt backup/snapshot/
+          (cd backup/snapshot && zip -qr ../archives/SN512A_GLUE5_FULL_SOURCE_AND_WORKFLOWS.zip .)
+
+          # A Git bundle lets a future developer recover the complete upstream
+          # commit history even if the original GLUE 5 GitHub project disappears.
+          git -C glue5-upstream bundle create \
+            "$GITHUB_WORKSPACE/backup/archives/GLUE5_UPSTREAM_FULL_HISTORY.bundle" --all
+          git -C glue5-upstream bundle verify \
+            "$GITHUB_WORKSPACE/backup/archives/GLUE5_UPSTREAM_FULL_HISTORY.bundle"
+
+          (cd backup/archives && sha256sum * > SHA256SUMS.txt)
+          du -h backup/archives/*
+          echo "Archived GLUE 5 commit: $commit"
+
+      - name: Upload downloadable independent backup files
+        uses: actions/upload-artifact@v4
+        with:
+          name: SN512A-GLUE5-SOURCE-INDEPENDENT-BACKUP
+          path: backup/archives/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Mirror source snapshot to a persistent isolated branch in our repo
+        shell: bash
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWN_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branch='glue5-source-backup'
+          mkdir mirror
+          cd mirror
+          git init -b "$branch"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Fast-forward whenever the branch already exists, preserving older
+          # source-backup versions in commit history instead of deleting them.
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${OWN_REPOSITORY}.git"
+          if git -c credential.helper= fetch "$remote" "refs/heads/$branch" 2>/dev/null; then
+            git checkout -B "$branch" FETCH_HEAD
+          fi
+          rsync -a --delete --exclude='.git' ../backup/snapshot/ ./
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Backup GLUE5 source $(cat ../backup/GLUE5_UPSTREAM_COMMIT.txt)"
+          fi
+          git -c credential.helper= push "$remote" HEAD:"refs/heads/$branch"
+          echo "Source preserved on branch: $branch"
