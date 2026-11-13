@@ -1,0 +1,316 @@
+# Experimental SN512A 768 MiB STREAMING resource-heap test, using GLUE 5.
+# Important: GLUE 5 is a different runtime from the existing BytArch/V5b/V7 APK.
+# The special behavior works because GLUE 5 ALREADY hooks the RAGE buddy allocator.
+# It is NOT safe to simulate this by capping WebAssembly memory to 768 MiB.
+#
+# Private game data: attach your own matching game.wasm to a DRAFT RELEASE in
+# this repository, NEVER commit it or publish it. The APK goes back into that draft.
+name: SN512A GTA V V8.2 - GLUE5 GPU Lost Diagnostic (experimental)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sn512a-v82-glue5-android
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: glue5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}/glue5
+      MISE_TASK_RUN_AUTO_INSTALL: 'false'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out our workflow repository (never includes game.wasm)
+        uses: actions/checkout@v4
+        with:
+          path: user-repo
+          persist-credentials: false
+      - name: Check out GLUE 5 source for its actual memory-budget hooks
+        uses: actions/checkout@v4
+        with:
+          repository: mempage4k/glue5
+          ref: main
+          path: glue5
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify low-memory streaming budget and force 768 MiB for this SN512A test
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          imports = Path('crates/glue5-runtime/src/imports.rs')
+          mem = Path('crates/glue5-runtime/src/memory.rs')
+          old = imports.read_text()
+          hook = mem.read_text()
+          expected = 'None if name == "gameResourceMB" && low => default.min(768),'
+          replacement = 'None if name == "gameResourceMB" => 768,'
+          if old.count(expected) != 1:
+              raise SystemExit('GLUE5 upstream changed gameResourceMB handling; refusing unverified build.')
+          required = (
+              'pub(crate) fn budget_resource_heap(mb: u32)',
+              'pub(crate) unsafe extern "C" fn grow_heap(',
+              'pub(crate) unsafe extern "C" fn memory_available(',
+              'pub(crate) unsafe extern "C" fn largest_block(',
+              'hooks.grow_heap = Some(grow_heap);',
+              'hooks.memory_available = Some(memory_available);',
+              'hooks.largest_block = Some(largest_block);',
+          )
+          missing = [s for s in required if s not in hook]
+          if missing:
+              raise SystemExit('GLUE5 streaming-memory enforcement hooks missing: ' + repr(missing))
+          if 'crate::memory::budget_resource_heap(value)' not in old:
+              raise SystemExit('GLUE5 no longer connects the gameResourceMB value to heap budget.')
+          imports.write_text(old.replace(expected, replacement, 1))
+          assert imports.read_text().count(replacement) == 1
+          print('V8/source verified: Android gameResourceMB=768 MiB; RAGE streaming budget hooks available.')
+          print('The hooks intercept availability checks and allow necessary allocation growth.')
+          PY
+          git diff --check
+          git diff -- crates/glue5-runtime/src/imports.rs
+          sha256sum crates/glue5-runtime/src/imports.rs | tee "$RUNNER_TEMP/glue5_v8_memory_patch_sha256.txt"
+      - name: Install SN512A V8.2 on-device GPU diagnostics (no root or ADB)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_V82'
+          from pathlib import Path
+          path = Path('crates/glue5/src/lib.rs')
+          src = path.read_text()
+          target = 'mod paths;\n'
+          assert src.count(target) == 1, 'GLUE5 path modules changed'
+          src = src.replace(target, target + '#[cfg(target_os = "android")]\nmod sn512a_diag;\n', 1)
+          old = '''        // RUST_LOG as on desktop (the launch intent's extras, see Glue5Activity).
+                  let spec = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+                  let filter = android_logger::FilterBuilder::new().parse(&spec).build();
+                  let level = filter.filter();
+                  android_logger::init_once(android_logger::Config::default().with_tag("glue5").with_max_level(level).with_filter(filter));'''
+          # The Android native application uses only one process-wide log logger.
+          # Replace its logcat-only logger with a logcat + accessible-file logger.
+          assert src.count(old)==1, 'GLUE5 Android logger source changed'
+          src=src.replace(old, '''        // SN512A V8.2: initialize file logging in app::run
+                  // after SDL is ready to provide the app-owned external path.''', 1)
+          path.write_text(src)
+          path=Path('crates/glue5/src/paths.rs')
+          src=path.read_text()
+          old='#[cfg(target_os = "android")]\nfn android_external_dir() -> Option<PathBuf> {'
+          assert src.count(old)==1, 'GLUE5 Android external folder helper changed'
+          path.write_text(src.replace(old, '#[cfg(target_os = "android")]\npub(crate) fn android_external_dir() -> Option<PathBuf> {',1))
+          path=Path('crates/glue5/src/app.rs')
+          src=path.read_text()
+          startup='        let sdl = sdl3::init().map_err(|e| anyhow!("SDL: {e}"))?;'
+          assert src.count(startup)==1, 'GLUE5 SDL initialization changed'
+          src=src.replace(startup, startup + '\n        #[cfg(target_os = "android")]\n        crate::sn512a_diag::init();', 1)
+          anchor='''        let why = why.as_str();
+                  if let Err(e) = std::fs::write(self.user_dir.join(FAILURE_FILE), why) {'''
+          assert src.count(anchor)==1, 'GLUE5 game-stopped handler changed'
+          src=src.replace(anchor, '''        let why = why.as_str();
+                  #[cfg(target_os = "android")]
+                  crate::sn512a_diag::save_failure(&self.user_dir, why);
+                  if let Err(e) = std::fs::write(self.user_dir.join(FAILURE_FILE), why) {''',1)
+          path.write_text(src)
+          PY_V82
+          cat > crates/glue5/src/sn512a_diag.rs <<'RUST_V82'
+          //! SN512A diagnostics: preserves GLUE 5's GPU and runtime log:: events
+          //! in Android/data/local.glue5/files/logs/ without READ_LOGS, ADB or root.
+          //! Uses only app-owned external storage; does not modify game files.
+          use std::fs::{self, File};
+          use std::io::{self, Read, Seek, SeekFrom, Write};
+          use std::path::{Path, PathBuf};
+          use std::sync::{Mutex, OnceLock};
+          use std::time::{SystemTime, UNIX_EPOCH};
+          use log::{Level, LevelFilter, Log, Metadata, Record};
+          
+          #[link(name = "log")]
+          unsafe extern "C" {
+              fn __android_log_write(priority: std::os::raw::c_int,
+                                     tag: *const std::os::raw::c_char,
+                                     text: *const std::os::raw::c_char) -> std::os::raw::c_int;
+          }
+          
+          const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+          struct DualLogger {
+              path: Option<PathBuf>,
+              output: Mutex<Option<File>>,
+          }
+          static LOGGER: OnceLock<DualLogger> = OnceLock::new();
+          
+          fn log_dir() -> Option<PathBuf> {
+              let root = crate::paths::android_external_dir()?;
+              let dir = root.join("logs");
+              fs::create_dir_all(&dir).ok()?;
+              Some(dir)
+          }
+          
+          impl Log for DualLogger {
+              fn enabled(&self, m: &Metadata<'_>) -> bool { m.level() <= Level::Info }
+              fn log(&self, record: &Record<'_>) {
+                  if !self.enabled(record.metadata()) { return; }
+                  let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                  let line = format!("{}.{:03} [{}] {}: {}\n",
+                      now.as_secs(), now.subsec_millis(), record.level(), record.target(), record.args());
+                  // Keep Android logcat output, for standard troubleshooting too.
+                  let prio = match record.level() {
+                      Level::Error => 6, Level::Warn => 5, Level::Info => 4,
+                      Level::Debug => 3, Level::Trace => 2,
+                  };
+                  if let Ok(c) = std::ffi::CString::new(line.trim_end().replace('\0', " ")) {
+                      unsafe { __android_log_write(prio, c"glue5".as_ptr(), c.as_ptr()); }
+                  }
+                  if let Ok(mut out) = self.output.lock() {
+                      if let Some(path) = &self.path {
+                          if out.as_ref().is_some_and(|f| f.metadata().is_ok_and(|m| m.len() >= MAX_FILE_BYTES)) {
+                              // Retain the most recent 4 MiB, bounded to 8 MiB total.
+                              *out = None;
+                              let _ = fs::rename(path, path.with_file_name("host-previous.log"));
+                              *out = File::create(path).ok();
+                          }
+                      }
+                      if let Some(f) = out.as_mut() {
+                          let _ = f.write_all(line.as_bytes());
+                          // Device-lost errors must survive an immediate process exit.
+                          let _ = f.flush();
+                      }
+                  }
+              }
+              fn flush(&self) {
+                  if let Ok(mut out) = self.output.lock() {
+                      if let Some(f) = out.as_mut() { let _ = f.flush(); }
+                  }
+              }
+          }
+          
+          pub(crate) fn init() {
+              let path = log_dir().map(|dir| dir.join("host.log"));
+              if let Some(p) = &path {
+                  let _ = fs::rename(p, p.with_file_name("host-previous.log"));
+              }
+              let output = path.as_ref().and_then(|p| File::create(p).ok());
+              let _ = LOGGER.set(DualLogger { path, output: Mutex::new(output) });
+              if let Some(logger) = LOGGER.get() {
+                  if log::set_logger(logger).is_ok() {
+                      log::set_max_level(LevelFilter::Info);
+                      log::info!("SN512A V8.2 diagnostics active; GPU errors mirrored to Android/data/local.glue5/files/logs/host.log");
+                  }
+              }
+          }
+          
+          /// Copy only the last 1 MiB of the private game.log after a failure.
+          /// The full 20 GiB game folder is never touched or moved.
+          pub(crate) fn save_failure(user_dir: &Path, reason: &str) {
+              log::error!("SN512A V8.2 game stopped: {reason}");
+              let Some(dir) = log_dir() else { return; };
+              let _ = fs::write(dir.join("last-failure.txt"), format!("{reason}\n"));
+              let Ok(mut src) = File::open(user_dir.join("game.log")) else { return; };
+              let Ok(len) = src.metadata().map(|m| m.len()) else { return; };
+              if src.seek(SeekFrom::Start(len.saturating_sub(1 << 20))).is_err() { return; }
+              if let Ok(mut dst) = File::create(dir.join("game-tail.log")) {
+                  let _ = io::copy(&mut src.take(1 << 20), &mut dst);
+                  let _ = dst.flush();
+              }
+          }
+          RUST_V82
+          # All device lost, heartbeat and wgpu device error messages flow
+          # through log::error!, so the new logger records them without
+          # changing GPU synchronization or resource ownership.
+          grep -Fq 'sn512a_diag::init();' crates/glue5/src/app.rs
+          grep -Fq 'save_failure(&self.user_dir, why);' crates/glue5/src/app.rs
+          grep -Fq 'host.log' crates/glue5/src/sn512a_diag.rs
+          git diff --check
+          git diff --stat
+          echo 'SN512A V8.2: diagnostic logger installed, 768MiB stream budget remains unchanged.'
+      - name: Retrieve and verify the EXACT uploaded alternate game.wasm from PRIVATE DRAFT
+        id: game
+        run: |
+          set -euo pipefail
+          # Experimental: this file is NOT a GLUE 5 supported game build.
+          # Exact SHA is from the user's GitHub diagnostic, not guessed.
+          EXPECTED_SHA=dcd3dc966ae8ab78637137580da990f9acec2ecfba6c47d153bdc15e4b60ca02
+          EXPECTED_BYTES=63202762
+          game="$RUNNER_TEMP/game"
+          dest="$game/b/8b0b5899ed/game.wasm"
+          mkdir -p "$(dirname "$dest")"
+          # Select newest PRIVATE DRAFT containing a completed game.wasm upload.
+          release=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" | jq -r '[.[][] | select(.draft == true) | select(any(.assets[]?; .name == "game.wasm" and .state == "uploaded"))] | sort_by(.created_at) | last | .id // empty')
+          test -n "$release" || { echo 'ERROR: No private draft release with uploaded game.wasm.'; exit 1; }
+          asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -r '[.assets[] | select(.name == "game.wasm" and .state == "uploaded")] | if length == 1 then .[0].id else empty end')
+          test -n "$asset" || { echo 'ERROR: Draft must contain exactly one game.wasm.'; exit 1; }
+          curl --fail --show-error --silent --location \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/octet-stream' \
+            -o "$dest" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$asset"
+          actual_bytes=$(wc -c < "$dest" | tr -d ' ')
+          actual_sha=$(sha256sum "$dest" | cut -d' ' -f1)
+          echo "Uploaded file size: $actual_bytes; sha256: $actual_sha"
+          if [ "$actual_bytes" != "$EXPECTED_BYTES" ] || [ "$actual_sha" != "$EXPECTED_SHA" ]; then
+            echo 'ERROR: This is not the previously observed alternate game.wasm. No unsafe generic bypass.'
+            exit 1
+          fi
+          python3 - "$dest" <<'PYWASM'
+          from pathlib import Path
+          import sys
+          with open(sys.argv[1], 'rb') as f:
+              head = f.read(8)
+          if head != b'\x00asm\x01\x00\x00\x00':
+              raise SystemExit('Not a valid WebAssembly v1 binary header')
+          print('WASM header valid; content still NOT independently GLUE5-compatible.')
+          PYWASM
+          echo "GLUE5_GAME_DIR=$game" >> "$GITHUB_ENV"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo 'WARNING: GLUE5_ALLOW_UNKNOWN_BUILD is enabled for this exact SHA only; compatibility and stability are not verified.'
+      - name: Make room on runner
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Install official GLUE 5 Android build toolchain
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca
+        with:
+          version: 2026.7.5
+          install: false
+          cache_key_prefix: sn512a-v82-glue5-768
+      - name: Install tools from GLUE 5 project config
+        run: |
+          set -euo pipefail
+          mise install rust cmake java gradle android-sdk cargo:cargo-ndk
+      - name: Set up release signing key (preserve it for future updates)
+        run: |
+          set -euo pipefail
+          yes | mise exec -- sdkmanager --licenses >/dev/null || true
+          mkdir -p ~/.android
+          echo "ANDROID_USER_HOME=$HOME/.android" >> "$GITHUB_ENV"
+          cd ~/.android
+          "$GITHUB_WORKSPACE/glue5/.github/scripts/draft.sh" get '${{ steps.game.outputs.release }}' Glue5-android.keystore
+          if [ -f Glue5-android.keystore ]; then
+            mv Glue5-android.keystore debug.keystore
+          else
+            mise -C "$GITHUB_WORKSPACE/glue5" exec -- keytool -genkeypair -noprompt \
+              -keystore debug.keystore -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname 'CN=SN512A V8 Debug,O=Android,C=US'
+          fi
+      - name: Compile GLUE 5 Android AOT game and app
+        env:
+          # Official GLUE 5 build script explicitly permits an unknown build in
+          # experimental mode. Hook resolution can fail if code differs.
+          GLUE5_ALLOW_UNKNOWN_BUILD: '1'
+        run: |
+          set -euo pipefail
+          mise run android:build
+          test -s target/android/gradle/outputs/apk/release/Glue5-release.apk
+          cp target/android/gradle/outputs/apk/release/Glue5-release.apk "$RUNNER_TEMP/Glue5-android.apk"
+          cp ~/.android/debug.keystore "$RUNNER_TEMP/Glue5-android.keystore"
+          sha256sum "$RUNNER_TEMP/Glue5-android.apk"
+      - name: Keep signed test APK private in the SAME DRAFT release
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/glue5/.github/scripts/draft.sh" upload '${{ steps.game.outputs.release }}' Glue5-android.apk Glue5-android.keystore
+          echo 'V8.2 GLUE5 GPU diagnostic build uploaded to your PRIVATE DRAFT RELEASE. Logs: Android/data/local.glue5/files/logs/host.log; last-failure.txt; game-tail.log (if the app reports a failure). No GPU fix has been validated.' >> "$GITHUB_STEP_SUMMARY"
