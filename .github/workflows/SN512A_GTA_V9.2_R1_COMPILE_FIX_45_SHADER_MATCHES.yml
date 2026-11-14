@@ -1,0 +1,1974 @@
+# V9.2 R1 compile fix: prevent invalid `|| if` in generated sn512a_public_docs.rs.
+# No changes to shader IDs, shader mappings, renderer, or game assets.
+# V9.0: Read-only one-time diagnostics of 45 unresolved VS shader hashes.
+# Does NOT substitute shaders or modify on-phone shader index / game files.
+# Preserves hardware-tested V8.9 Boolean fix, one GPU encoder, GPU lifetimes.
+# V8.9: Compare uploaded working and downloaded indexes (4,986 versus 4,919).
+# 67 extra index entries are consts:false; the GLUE5 parser incorrectly uses
+# v.get("consts").is_some() and therefore treats FALSE as requiring constant tables.
+# V8.9 changes only this parser to parse the Boolean actual value. All existing
+# consts:true shaders retain their required tables. This directly addresses the
+# 67 missing-constant warnings in V8.8. The other 45 nonindexed hashes remain.
+# Preserve previous fully stable V8.8 APK, signing and ~20GB data.
+# V8.8 experiment built ON TOP OF the physically validated V8.7 R2 one-encoder branch.
+# Adds exact-hash translated shader recovery from user-owned sibling packs only.
+# A missing WGSL file cannot be reconstructed from hash/label; this build audits
+# the defect and writes a dedicated missing-shader file into public Documents.
+# CPU: preallocate per-pass attachment vectors while keeping the proven 1-worker
+# GPU submission fences, memory guards, optional V8.7 hot bind cache, signing,
+# and public Documents logger. NEVER uninstall: 20 GB game assets in Android/data.
+# Full GitHub Android build and on-device behavior NOT yet verified.
+# R2: public Documents/GLUE5-Logs export of all diagnostic log categories through Android MediaStore.
+# V8.7 R1 crash isolation: the 2-worker configuration was associated with GPU device loss at 542 MiB (<704 soft budget).
+# Never run 2 workers in this R1 workflow. R1 preserves the known-stable V8.6/V8.5 sync barriers.
+# Toggle cpu_fastpaths=yes to isolate RT/bind caching with one worker, or no for known V8.6-like baseline.
+# V8.7: Same build route as hardware-tested V8.6 (source comes from mempage4k/glue5).
+# Experimental GPU CPU fastpaths and optional 2 encoding workers. Preserve V8.5/8.6 APK.
+# THIS IS NOT A VERIFIED COMPILED BUILD; GitHub must compile it.
+# V8.6 adds low-impact scheduler instrumentation on top of confirmed stable V8.5.
+# Default is EXACT V8.5 GPU parallelism (1 encoder). Optional 2-worker test MAY destabilize.
+# Keep the known-good V8.5 APK: this build uploads under a new name.
+# Experimental V8.5 SN512A GPU device-loss A/B: change Vulkan command-pool recycling frequency only.
+# Important: GLUE 5 is a different runtime from the existing BytArch/V5b/V7 APK.
+# The special behavior works because GLUE 5 ALREADY hooks the RAGE buddy allocator.
+# It is NOT safe to simulate this by capping WebAssembly memory to 768 MiB.
+#
+# Private game data: attach your own matching game.wasm to a DRAFT RELEASE in
+# this repository, NEVER commit it or publish it. The APK goes back into that draft.
+name: SN512A GTA V V9.2 R1 - Compile Fix + 45 Experimental Vertex Shader Matches
+
+on:
+  workflow_dispatch:
+    inputs:
+      pool_policy:
+        description: "Vulkan command-pool recycling: conservative (less frequent) or baseline (V8.3 behavior)"
+        required: true
+        type: choice
+        options:
+          - conservative
+          - baseline
+        default: baseline
+      sync_policy:
+        description: "GPU resource lifetime: strict waits for completed GPU epochs; baseline retains V8.5 behavior"
+        required: true
+        type: choice
+        options:
+          - strict
+        default: strict
+      gpu_soft_budget_mb:
+        description: "Live GPU allocation estimate triggering safe cache trimming (not a hard limit)"
+        required: true
+        type: choice
+        options:
+          - "640"
+          - "704"
+          - "768"
+        default: "704"
+      encoder_workers:
+        description: "R1: one worker only. The V8.7 two-worker configuration lost its Vulkan device."
+        required: true
+        type: choice
+        options:
+          - "1"
+        default: "1"
+      cpu_fastpaths:
+        description: "Known-stable V8.7 R2 state caching; yes was hardware-tested 45min with one encoder"
+        required: true
+        type: choice
+        options:
+          - "yes"
+          - "no"
+        default: "yes"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sn512a-v92-r1-compile-fix-one-encoder-android
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: glue5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}/glue5
+      MISE_TASK_RUN_AUTO_INSTALL: 'false'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out our workflow repository (never includes game.wasm)
+        uses: actions/checkout@v4
+        with:
+          path: user-repo
+          persist-credentials: false
+      - name: Check out GLUE 5 source for its actual memory-budget hooks
+        uses: actions/checkout@v4
+        with:
+          repository: mempage4k/glue5
+          ref: main
+          path: glue5
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify low-memory streaming budget and force 768 MiB for this SN512A test
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          imports = Path('crates/glue5-runtime/src/imports.rs')
+          mem = Path('crates/glue5-runtime/src/memory.rs')
+          old = imports.read_text()
+          hook = mem.read_text()
+          expected = 'None if name == "gameResourceMB" && low => default.min(768),'
+          replacement = 'None if name == "gameResourceMB" => 768,'
+          if old.count(expected) != 1:
+              raise SystemExit('GLUE5 upstream changed gameResourceMB handling; refusing unverified build.')
+          required = (
+              'pub(crate) fn budget_resource_heap(mb: u32)',
+              'pub(crate) unsafe extern "C" fn grow_heap(',
+              'pub(crate) unsafe extern "C" fn memory_available(',
+              'pub(crate) unsafe extern "C" fn largest_block(',
+              'hooks.grow_heap = Some(grow_heap);',
+              'hooks.memory_available = Some(memory_available);',
+              'hooks.largest_block = Some(largest_block);',
+          )
+          missing = [s for s in required if s not in hook]
+          if missing:
+              raise SystemExit('GLUE5 streaming-memory enforcement hooks missing: ' + repr(missing))
+          if 'crate::memory::budget_resource_heap(value)' not in old:
+              raise SystemExit('GLUE5 no longer connects the gameResourceMB value to heap budget.')
+          imports.write_text(old.replace(expected, replacement, 1))
+          assert imports.read_text().count(replacement) == 1
+          print('V8/source verified: Android gameResourceMB=768 MiB; RAGE streaming budget hooks available.')
+          print('The hooks intercept availability checks and allow necessary allocation growth.')
+          PY
+          git diff --check
+          git diff -- crates/glue5-runtime/src/imports.rs
+          sha256sum crates/glue5-runtime/src/imports.rs | tee "$RUNNER_TEMP/glue5_v8_memory_patch_sha256.txt"
+      - name: Install SN512A V8.2 on-device GPU diagnostics (no root or ADB)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_V82'
+          from pathlib import Path
+          path = Path('crates/glue5/src/lib.rs')
+          src = path.read_text()
+          target = 'mod paths;\n'
+          assert src.count(target) == 1, 'GLUE5 path modules changed'
+          src = src.replace(target, target + '#[cfg(target_os = "android")]\nmod sn512a_diag;\n', 1)
+          old = '''        // RUST_LOG as on desktop (the launch intent's extras, see Glue5Activity).
+                  let spec = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+                  let filter = android_logger::FilterBuilder::new().parse(&spec).build();
+                  let level = filter.filter();
+                  android_logger::init_once(android_logger::Config::default().with_tag("glue5").with_max_level(level).with_filter(filter));'''
+          # The Android native application uses only one process-wide log logger.
+          # Replace its logcat-only logger with a logcat + accessible-file logger.
+          assert src.count(old)==1, 'GLUE5 Android logger source changed'
+          src=src.replace(old, '''        // SN512A V8.2: initialize file logging in app::run
+                  // after SDL is ready to provide the app-owned external path.''', 1)
+          path.write_text(src)
+          path=Path('crates/glue5/src/paths.rs')
+          src=path.read_text()
+          old='#[cfg(target_os = "android")]\nfn android_external_dir() -> Option<PathBuf> {'
+          assert src.count(old)==1, 'GLUE5 Android external folder helper changed'
+          path.write_text(src.replace(old, '#[cfg(target_os = "android")]\npub(crate) fn android_external_dir() -> Option<PathBuf> {',1))
+          path=Path('crates/glue5/src/app.rs')
+          src=path.read_text()
+          # Match the SDL initialization statement by its content, rather than
+          # assuming eight leading spaces. Current GLUE 5 uses four.
+          startup='let sdl = sdl3::init().map_err(|e| anyhow!("SDL: {e}"))?;'
+          assert src.count(startup)==1, 'GLUE5 SDL initialization statement missing or ambiguous'
+          src=src.replace(startup, startup + '\n    #[cfg(target_os = "android")]\n    crate::sn512a_diag::init();', 1)
+          anchor='''        let why = why.as_str();
+                  if let Err(e) = std::fs::write(self.user_dir.join(FAILURE_FILE), why) {'''
+          assert src.count(anchor)==1, 'GLUE5 game-stopped handler changed'
+          src=src.replace(anchor, '''        let why = why.as_str();
+                  #[cfg(target_os = "android")]
+                  crate::sn512a_diag::save_failure(&self.user_dir, why);
+                  if let Err(e) = std::fs::write(self.user_dir.join(FAILURE_FILE), why) {''',1)
+          path.write_text(src)
+          PY_V82
+          cat > crates/glue5/src/sn512a_diag.rs <<'RUST_V82'
+          //! SN512A diagnostics: preserves GLUE 5's GPU and runtime log:: events
+          //! in Android/data/local.glue5/files/logs/ without READ_LOGS, ADB or root.
+          //! Uses only app-owned external storage; does not modify game files.
+          use std::fs::{self, File};
+          use std::io::{self, Read, Seek, SeekFrom, Write};
+          use std::path::{Path, PathBuf};
+          use std::sync::{Mutex, OnceLock};
+          use std::time::{SystemTime, UNIX_EPOCH};
+          use log::{Level, LevelFilter, Log, Metadata, Record};
+          
+          #[link(name = "log")]
+          unsafe extern "C" {
+              fn __android_log_write(priority: std::os::raw::c_int,
+                                     tag: *const std::os::raw::c_char,
+                                     text: *const std::os::raw::c_char) -> std::os::raw::c_int;
+          }
+          
+          const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+          struct DualLogger {
+              path: Option<PathBuf>,
+              output: Mutex<Option<File>>,
+          }
+          static LOGGER: OnceLock<DualLogger> = OnceLock::new();
+          
+          fn log_dir() -> Option<PathBuf> {
+              let root = crate::paths::android_external_dir()?;
+              let dir = root.join("logs");
+              fs::create_dir_all(&dir).ok()?;
+              Some(dir)
+          }
+          
+          impl Log for DualLogger {
+              fn enabled(&self, m: &Metadata<'_>) -> bool { m.level() <= Level::Info }
+              fn log(&self, record: &Record<'_>) {
+                  if !self.enabled(record.metadata()) { return; }
+                  let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                  let line = format!("{}.{:03} [{}] {}: {}\n",
+                      now.as_secs(), now.subsec_millis(), record.level(), record.target(), record.args());
+                  // Keep Android logcat output, for standard troubleshooting too.
+                  let prio = match record.level() {
+                      Level::Error => 6, Level::Warn => 5, Level::Info => 4,
+                      Level::Debug => 3, Level::Trace => 2,
+                  };
+                  if let Ok(c) = std::ffi::CString::new(line.trim_end().replace('\0', " ")) {
+                      unsafe { __android_log_write(prio, c"glue5".as_ptr(), c.as_ptr()); }
+                  }
+                  if let Ok(mut out) = self.output.lock() {
+                      if let Some(path) = &self.path {
+                          if out.as_ref().is_some_and(|f| f.metadata().is_ok_and(|m| m.len() >= MAX_FILE_BYTES)) {
+                              // Retain the most recent 4 MiB, bounded to 8 MiB total.
+                              *out = None;
+                              let _ = fs::rename(path, path.with_file_name("host-previous.log"));
+                              *out = File::create(path).ok();
+                          }
+                      }
+                      if let Some(f) = out.as_mut() {
+                          let _ = f.write_all(line.as_bytes());
+                          // Device-lost errors must survive an immediate process exit.
+                          let _ = f.flush();
+                      }
+                  }
+              }
+              fn flush(&self) {
+                  if let Ok(mut out) = self.output.lock() {
+                      if let Some(f) = out.as_mut() { let _ = f.flush(); }
+                  }
+              }
+          }
+          
+          pub(crate) fn init() {
+              let path = log_dir().map(|dir| dir.join("host.log"));
+              if let Some(p) = &path {
+                  let _ = fs::rename(p, p.with_file_name("host-previous.log"));
+              }
+              let output = path.as_ref().and_then(|p| File::create(p).ok());
+              let _ = LOGGER.set(DualLogger { path, output: Mutex::new(output) });
+              if let Some(logger) = LOGGER.get() {
+                  if log::set_logger(logger).is_ok() {
+                      log::set_max_level(LevelFilter::Info);
+                      log::info!("SN512A V8.2 diagnostics active; GPU errors mirrored to Android/data/local.glue5/files/logs/host.log");
+                  }
+              }
+          }
+          
+          /// Copy only the last 1 MiB of the private game.log after a failure.
+          /// The full 20 GiB game folder is never touched or moved.
+          pub(crate) fn save_failure(user_dir: &Path, reason: &str) {
+              log::error!("SN512A V8.2 game stopped: {reason}");
+              let Some(dir) = log_dir() else { return; };
+              let _ = fs::write(dir.join("last-failure.txt"), format!("{reason}\n"));
+              let Ok(mut src) = File::open(user_dir.join("game.log")) else { return; };
+              let Ok(len) = src.metadata().map(|m| m.len()) else { return; };
+              if src.seek(SeekFrom::Start(len.saturating_sub(1 << 20))).is_err() { return; }
+              if let Ok(mut dst) = File::create(dir.join("game-tail.log")) {
+                  let _ = io::copy(&mut src.take(1 << 20), &mut dst);
+                  let _ = dst.flush();
+              }
+          }
+          RUST_V82
+          # All device lost, heartbeat and wgpu device error messages flow
+          # through log::error!, so the new logger records them without
+          # changing GPU synchronization or resource ownership.
+          grep -Fq 'sn512a_diag::init();' crates/glue5/src/app.rs
+          grep -Fq 'SN512A V8.2' crates/glue5/src/sn512a_diag.rs
+          grep -Fq 'save_failure(&self.user_dir, why);' crates/glue5/src/app.rs
+          grep -Fq 'host.log' crates/glue5/src/sn512a_diag.rs
+          git diff --check
+          git diff --stat
+          echo 'SN512A V8.2: diagnostic logger installed, 768MiB stream budget remains unchanged.'
+      - name: Install SN512A V8.3 graphics controls in the native Settings menu
+        run: |
+          set -euo pipefail
+          cat > /tmp/sn512a_v83_patch.py <<'PY_SN512A_GRAPHICS'
+          #!/usr/bin/env python3
+          """Add an SN512A graphics settings tab to GLUE5's native pre-launch UI.
+          
+          Uses upstream GTA V settings.xml to alter actual game graphics settings. Only
+          edits while game is stopped. Existing engine pause-menu controls still work.
+          """
+          from pathlib import Path
+          import sys
+          
+          root = Path(sys.argv[1])
+          
+          
+          def transform(rel, ops):
+              f = root / rel
+              src = f.read_text()
+              for old, new, label in ops:
+                  n = src.count(old)
+                  if n != 1:
+                      raise RuntimeError(f'{rel}: {label}: expected 1 match, found {n}. Refusing to patch unknown upstream source')
+                  src = src.replace(old, new, 1)
+              f.write_text(src)
+              print('patched', f)
+          
+          
+          # V8.3 FIX2: match only the SettingsTab enum, not the adjacent
+          # `pub struct Ui` declaration. The previous brittle complete-span
+          # string raised `expected 1 match, found 0` on the user's checkout.
+          import re
+          ui_file = root / 'crates/glue5/src/ui.rs'
+          original_ui = ui_file.read_text()
+          enum = re.search(r'(?s)\benum\s+SettingsTab\s*\{(?P<body>.*?)\n\}', original_ui)
+          if enum is None:
+              raise RuntimeError('SettingsTab enum not present; refusing unknown source')
+          body = enum.group('body')
+          if len(re.findall(r'(?m)^\s*Video,\s*$', body)) != 1:
+              raise RuntimeError('Expected one Video tab in SettingsTab')
+          if 'Graphics,' in body:
+              raise RuntimeError('Graphics tab already present; use clean upstream checkout')
+          if len(re.findall(r'(?m)^\s*Controls,\s*$', body)) != 1 or len(re.findall(r'(?m)^\s*Game,\s*$', body)) != 1:
+              raise RuntimeError('Expected Controls and Game tabs not found')
+          new_body, replacements = re.subn(
+              r'(?m)^(?P<indent>[ \t]*)Video,[ \t]*$',
+              lambda m: m.group(0) + '\n' + m.group('indent') + 'Graphics,',
+              body, count=1)
+          if replacements != 1:
+              raise RuntimeError('Could not insert Graphics enum variant')
+          updated_ui = original_ui[:enum.start('body')] + new_body + original_ui[enum.end('body'):]
+          ui_file.write_text(updated_ui)
+          print('Patched SettingsTab enum with Graphics, preserving #[default] Video')
+          
+          transform('crates/glue5-runtime/src/game_settings.rs', [(
+              '#[cfg(test)]\nmod tests {',
+              '''/// Read a graphic setting from settings.xml (or the engine's defaults).
+          /// Exposed to the SN512A pre-launch UI; no live game-memory manipulation.
+          pub fn read_setting(user_dir: &Path, name: &str) -> Option<String> {
+              let xml = std::fs::read_to_string(path(user_dir)).unwrap_or_else(|_| DEFAULTS.to_string());
+              let tag = format!("<{name} value=\\\"");
+              let start = xml.find(&tag)? + tag.len();
+              let end = xml[start..].find('"')?;
+              Some(xml[start..start + end].to_owned())
+          }
+          #[cfg(test)]
+          mod tests {''',
+              'read_setting helper',
+          )])
+          
+          transform('crates/glue5/src/ui/pages.rs', [
+              (
+                  'let tabs = [(SettingsTab::Video, "VIDEO"), (SettingsTab::Controls, "CONTROLS"), (SettingsTab::Game, "GAME")];',
+                  'let tabs = [(SettingsTab::Video, "VIDEO"), (SettingsTab::Graphics, "GRAPHICS"), (SettingsTab::Controls, "CONTROLS"), (SettingsTab::Game, "GAME")];',
+                  'settings tabs',
+              ),
+              (
+                  'fn settings_items(\n    ui: &mut egui::Ui,',
+                  '''// SN512A V8.3: graphics settings are the ENGINE's own values, not
+          // emulator-only switches. Use the normal in-game Graphics menu while playing.
+          // Changing graphics from this page is allowed before game launch only.
+          fn sn512a_graphics_choice(
+              ui: &mut egui::Ui,
+              dir: &std::path::Path,
+              title: &str,
+              key: &str,
+              options: &[(&str, &str)],
+          ) {
+              let current = glue5_runtime::game_settings::read_setting(dir, key).unwrap_or_default();
+              let mut selected = options.iter().position(|(v, _)| *v == current).unwrap_or(0);
+              let choices: Vec<(usize, &str)> = options.iter().enumerate().map(|(i, (_, label))| (i, *label)).collect();
+              let resp = setting(ui, title, Control::Choice, None, |ui| choice(ui, &mut selected, &choices));
+              if resp.changed() {
+                  if let Err(e) = glue5_runtime::game_settings::apply(dir, &[(key, options[selected].0)]) {
+                      ui.colored_label(WARN, format!("Could not save {title}: {e}"));
+                  }
+              }
+          }
+          
+          fn sn512a_graphics_menu(ui: &mut egui::Ui, settings: &mut Settings, status: &Status) {
+              if status.started.is_some() {
+                  ui.label("Graphics changes while playing: open the game's menu (☰ / Start), then Settings > Graphics or Advanced Graphics.");
+                  ui.label("Some changes require restarting the game.");
+                  return;
+              }
+              let Ok(dir) = paths::user_dir() else {
+                  ui.colored_label(WARN, "Cannot locate game settings directory");
+                  return;
+              };
+              // Preserve GLUE 5's normal initial low-memory baseline, then let the
+              // player override individual quality options. Do not change 768 MiB pool.
+              if settings.low_memory && !settings.low_preset_written {
+                  if glue5_runtime::game_settings::apply_low_preset(&dir).is_ok() {
+                      settings.low_preset_written = true;
+                  } else {
+                      ui.colored_label(WARN, "Could not write initial low-memory graphics preset");
+                      return;
+                  }
+              }
+              ui.label("SN512A graphics quality - applies at the next launch. Keep Low memory ON for 6 GB RAM.");
+              ui.label("Higher texture, grass and distance settings can cause GPU loss or memory pressure.");
+              sn512a_graphics_choice(ui, &dir, "View distance", "LodScale", &[
+                  ("0.000000", "Minimum"), ("0.250000", "25%"), ("0.500000", "50%"),
+                  ("0.750000", "75%"), ("1.000000", "Maximum"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Texture quality", "TextureQuality", &[
+                  ("0", "Normal"), ("1", "High"), ("2", "Very high"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Water quality", "WaterQuality", &[
+                  ("0", "Normal"), ("1", "High"), ("2", "Very high"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Grass quality", "GrassQuality", &[
+                  ("0", "Normal"), ("1", "High"), ("2", "Very high"), ("3", "Ultra"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Shadow quality", "ShadowQuality", &[
+                  ("1", "Normal"), ("2", "High"), ("3", "Very high"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Shadow edges", "Shadow_SoftShadows", &[
+                  ("0", "Sharp"), ("1", "Soft"), ("2", "Softer"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Reflections", "ReflectionQuality", &[
+                  ("0", "Normal"), ("1", "High"), ("2", "Very high"), ("3", "Ultra"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Reflection AA", "ReflectionMSAA", &[
+                  ("0", "Off"), ("2", "2x"), ("4", "4x"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Particle quality", "ParticleQuality", &[
+                  ("0", "Normal"), ("1", "High"), ("2", "Very high"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Population density", "CityDensity", &[
+                  ("0.000000", "Minimum"), ("0.250000", "25%"), ("0.500000", "50%"),
+                  ("0.750000", "75%"), ("1.000000", "Maximum"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Extended distance", "MaxLodScale", &[
+                  ("0.000000", "Off"), ("0.250000", "25%"), ("0.500000", "50%"),
+                  ("1.000000", "Maximum"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Long shadows", "Shadow_LongShadows", &[
+                  ("false", "Off"), ("true", "On"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "Ambient occlusion", "SSAO", &[
+                  ("0", "Off"), ("1", "Normal"), ("2", "High"),
+              ]);
+              sn512a_graphics_choice(ui, &dir, "FXAA", "FXAA_Enabled", &[
+                  ("false", "Off"), ("true", "On"),
+              ]);
+              // MSAA is deliberately absent: GLUE 5's DirectX 10 shader path does not
+              // support it. ShaderQuality Normal is also unsafe on this build.
+              ui.label("MSAA disabled: unsupported by GLUE 5's DX10 shader path. Shader quality remains at the supported level.");
+          }
+          
+          fn settings_items(
+              ui: &mut egui::Ui,''',
+                  'graphics menu insertion',
+              ),
+              (
+                  '        SettingsTab::Controls => {',
+                  '        SettingsTab::Graphics => sn512a_graphics_menu(ui, settings, status),\n        SettingsTab::Controls => {',
+                  'graphics match arm',
+              ),
+              (
+                  '[SettingsTab::Video, SettingsTab::Controls, SettingsTab::Game]',
+                  '[SettingsTab::Video, SettingsTab::Graphics, SettingsTab::Controls, SettingsTab::Game]',
+                  'settings layout tests',
+              ),
+          ])
+          
+          print('SN512A V8.3 pre-launch GRAPHICS menu source patch complete; not compiled or phone-tested.')
+          PY_SN512A_GRAPHICS
+          python3 -m py_compile /tmp/sn512a_v83_patch.py
+          python3 /tmp/sn512a_v83_patch.py .
+          git diff --check
+          grep -Fq 'fn sn512a_graphics_menu' crates/glue5/src/ui/pages.rs
+          grep -Fq 'Graphics,' crates/glue5/src/ui.rs
+          git diff --stat
+          echo 'V8.3 graphics tab added. Source-only validation; actual compile follows.'
+      - name: Retrieve and verify the EXACT uploaded alternate game.wasm from PRIVATE DRAFT
+        id: game
+        run: |
+          set -euo pipefail
+          # Experimental: this file is NOT a GLUE 5 supported game build.
+          # Exact SHA is from the user's GitHub diagnostic, not guessed.
+          EXPECTED_SHA=dcd3dc966ae8ab78637137580da990f9acec2ecfba6c47d153bdc15e4b60ca02
+          EXPECTED_BYTES=63202762
+          game="$RUNNER_TEMP/game"
+          dest="$game/b/8b0b5899ed/game.wasm"
+          mkdir -p "$(dirname "$dest")"
+          # Select newest PRIVATE DRAFT containing a completed game.wasm upload.
+          release=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" | jq -r '[.[][] | select(.draft == true) | select(any(.assets[]?; .name == "game.wasm" and .state == "uploaded"))] | sort_by(.created_at) | last | .id // empty')
+          test -n "$release" || { echo 'ERROR: No private draft release with uploaded game.wasm.'; exit 1; }
+          asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -r '[.assets[] | select(.name == "game.wasm" and .state == "uploaded")] | if length == 1 then .[0].id else empty end')
+          test -n "$asset" || { echo 'ERROR: Draft must contain exactly one game.wasm.'; exit 1; }
+          curl --fail --show-error --silent --location \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/octet-stream' \
+            -o "$dest" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$asset"
+          actual_bytes=$(wc -c < "$dest" | tr -d ' ')
+          actual_sha=$(sha256sum "$dest" | cut -d' ' -f1)
+          echo "Uploaded file size: $actual_bytes; sha256: $actual_sha"
+          if [ "$actual_bytes" != "$EXPECTED_BYTES" ] || [ "$actual_sha" != "$EXPECTED_SHA" ]; then
+            echo 'ERROR: This is not the previously observed alternate game.wasm. No unsafe generic bypass.'
+            exit 1
+          fi
+          python3 - "$dest" <<'PYWASM'
+          from pathlib import Path
+          import sys
+          with open(sys.argv[1], 'rb') as f:
+              head = f.read(8)
+          if head != b'\x00asm\x01\x00\x00\x00':
+              raise SystemExit('Not a valid WebAssembly v1 binary header')
+          print('WASM header valid; content still NOT independently GLUE5-compatible.')
+          PYWASM
+          echo "GLUE5_GAME_DIR=$game" >> "$GITHUB_ENV"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo 'WARNING: GLUE5_ALLOW_UNKNOWN_BUILD is enabled for this exact SHA only; compatibility and stability are not verified.'
+      - name: Make room on runner
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Install official GLUE 5 Android build toolchain
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca
+        with:
+          version: 2026.7.5
+          install: false
+          cache_key_prefix: sn512a-v87-glue5-vulkan
+      - name: Install tools from GLUE 5 project config
+        run: |
+          set -euo pipefail
+          mise install rust cmake java gradle android-sdk cargo:cargo-ndk
+      - name: V8.5 - Apply upstream wgpu-hal patches first, then adjust prepared Vulkan source
+        env:
+          POOL_POLICY: ${{ inputs.pool_policy }}
+        run: |
+          set -euo pipefail
+          # FIX1: The earlier workflow edited patch 0003 before `mise run setup`.
+          # Upstream patch 0013 relies on the ORIGINAL condition in patch 0003
+          # as context, so it failed to apply (src/vulkan/command.rs:195).
+          # Keep BOTH upstream patches pristine, apply all 0013 patches, THEN
+          # adjust the already-patched Vulkan command encoder source directly.
+          # The setup dependency of android:build uses an unchanged patch stamp,
+          # therefore it reuses the prepared source instead of overwriting it.
+          mkdir -p "$RUNNER_TEMP/v85-audit"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/v85-audit/upstream-commit.txt"
+          echo "Selected pool policy: $POOL_POLICY" | tee "$RUNNER_TEMP/v85-audit/pool-policy.txt"
+          git diff -- patches/wgpu-hal/ > "$RUNNER_TEMP/v85-audit/upstream-vulkan-patch-diff.txt"
+          if [ -s "$RUNNER_TEMP/v85-audit/upstream-vulkan-patch-diff.txt" ]; then
+            echo 'ERROR: upstream Vulkan patch files were already modified; refusing to continue.'
+            exit 1
+          fi
+          # Apply GLUE5's entire tested, ordered patch stack WITHOUT edits.
+          mise run setup
+          code=third_party/wgpu-hal/src/vulkan/command.rs
+          test -s "$code" || { echo 'Patched wgpu-hal command.rs is missing'; exit 1; }
+          python3 - "$code" "$POOL_POLICY" "$RUNNER_TEMP/v85-audit" <<'PY_SN512A_V85_POOL'
+          from pathlib import Path
+          import hashlib
+          import sys
+
+          path, policy, report = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+          assert policy in ('baseline', 'conservative'), policy
+          original = path.read_text()
+          # These markers come from GLUE5's upstream 0003 + 0013 patch stack.
+          required = ('const REPLACE_AFTER: u32 = 8;',
+                      'if self.slack >= REPLACE_AFTER {',
+                      'self.device.retired_command_pools.lock().push(self.raw);')
+          missing = [m for m in required if m not in original]
+          if missing:
+              raise SystemExit('GLUE5 upstream command pool patch stack changed: ' + repr(missing))
+          old = 'if unused >= 4 && unused >= used {'
+          new = 'if unused >= 12 && unused >= used.saturating_mul(3) {'
+          if original.count(old) != 1 or new in original:
+              raise SystemExit('Expected exactly one unmodified upstream Vulkan pool threshold; review source before patching')
+          if policy == 'conservative':
+              changed = original.replace(old, new, 1)
+              path.write_text(changed)
+              if path.read_text().count(new) != 1:
+                  raise SystemExit('Conservative Vulkan change was not written')
+              print('V8.5: once 12 spare buffers are available and >=3x last use, increment slack; retire pool after 8 repeated qualifying resets.')
+          else:
+              changed = original
+              print('V8.5 baseline: no changes to upstream GLUE5 patched wgpu-hal source')
+          (report / 'command-source-before.sha256').write_text(hashlib.sha256(original.encode()).hexdigest() + '\n')
+          (report / 'command-source-after.sha256').write_text(hashlib.sha256(changed.encode()).hexdigest() + '\n')
+          (report / 'vulkan-conditional.txt').write_text(new if policy == 'conservative' else old)
+          PY_SN512A_V85_POOL
+          grep -Fq 'const REPLACE_AFTER: u32 = 8;' "$code"
+          if [ "$POOL_POLICY" = conservative ]; then
+            grep -Fq 'if unused >= 12 && unused >= used.saturating_mul(3) {' "$code"
+          else
+            grep -Fq 'if unused >= 4 && unused >= used {' "$code"
+          fi
+          sha256sum "$code" | tee "$RUNNER_TEMP/v85-audit/wgpu-hal-command-sha256.txt"
+          echo "V8.5 Vulkan mode: $POOL_POLICY" >> "$GITHUB_STEP_SUMMARY"
+      - name: V8.5 - GPU completion lifetimes, safe memory pressure and Mali compute preflight
+        env:
+          SYNC_POLICY: ${{ inputs.sync_policy }}
+          GPU_SOFT_BUDGET_MB: ${{ inputs.gpu_soft_budget_mb }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_SN512A_V85'
+          from pathlib import Path
+          import os, hashlib, json
+
+          policy=os.environ['SYNC_POLICY']
+          budget=int(os.environ['GPU_SOFT_BUDGET_MB'])
+          if policy not in ('strict','baseline') or budget not in (640,704,768):
+              raise SystemExit('Invalid V8.5 policy inputs')
+
+          changes=[]
+          def exact(rel, old, new, label):
+              f=Path(rel)
+              src=f.read_text()
+              n=src.count(old)
+              if n != 1:
+                  raise SystemExit(f'V8.5 {label}: expected one source anchor, found {n} in {rel}. Stop before building')
+              f.write_text(src.replace(old,new,1))
+              changes.append({'file':rel,'change':label})
+
+          # 1) GPU RESOURCE LIFETIME - in strict mode, drop objects only after their
+          # submission's completion callback. Unlike the old 2-frame heuristic,
+          # these retired wgpu handles cannot be freed before their GPU epoch finishes.
+          # The kernel's device-loss fault is still unproven, so compare this with baseline.
+          submit='crates/glue5-gpu/src/submit.rs'
+          if policy=='strict':
+              exact(submit, 'const FRAMES_IN_FLIGHT: usize = 2;', 'const FRAMES_IN_FLIGHT: usize = 1;', 'one in-flight frame')
+              exact(submit, 'const PENDING: usize = 8;', 'const PENDING: usize = 4;', 'bounded pending batches')
+              exact(submit, 'const ENCODE_THREADS: usize = 2;', 'const ENCODE_THREADS: usize = 1;', 'serialized GPU encoding')
+              exact(submit,
+                    '    let mut graves: Vec<Grave> = Vec::new();\n    let mut graves_frames = 0;',
+                    '    let mut graves: VecDeque<(u64, Vec<Grave>)> = VecDeque::new();',
+                    'per-epoch retired-resource queue')
+              exact(submit,
+                    '''        let (finished, epoch) = (finished.clone(), batch.epoch);
+                  queue.on_submitted_work_done(move || {
+                      finished.fetch_max(epoch, Ordering::Release);
+                  });''',
+                    '''        let finished_for_callback = finished.clone();
+                  let epoch = batch.epoch;
+                  queue.on_submitted_work_done(move || {
+                      finished_for_callback.fetch_max(epoch, Ordering::Release);
+                  });''',
+                    'preserve the finished-epoch observable outside completion callback')
+              exact(submit,
+                    '''        graves.extend(batch.graves);
+                  graves_frames += (batch.frame && !graves.is_empty()) as u32;
+                  if !graves.is_empty() && (encoding.load(Ordering::Acquire) == 0 || graves_frames >= 2) {
+                      let t = Instant::now();
+                      graves.clear();
+                      graves_frames = 0;
+                      stats.release_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                  }''',
+                    '''        if !batch.graves.is_empty() {
+                      graves.push_back((batch.epoch, batch.graves));
+                  }
+                  // Strict SN512A experiment: an engine object is no longer referenced
+                  // by its D3D handle, but do not drop its wgpu handle until the GPU
+                  // confirms it has finished that batch. Never call destroy() here.
+                  let completed_epoch = finished.load(Ordering::Acquire);
+                  let t_release = Instant::now();
+                  let mut dropped = 0usize;
+                  while graves.front().is_some_and(|(epoch, _)| *epoch <= completed_epoch) {
+                      if let Some((_, retired)) = graves.pop_front() {
+                          dropped += retired.len();
+                      }
+                  }
+                  if dropped != 0 {
+                      stats.release_ns.fetch_add(t_release.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                  }
+                  if batch.epoch.is_multiple_of(256) {
+                      log::info!("SN512A V8.5 GPU lifetimes: batch={} finished={} retired_batches={} released_objects={} encoding_jobs={}",
+                          batch.epoch, completed_epoch, graves.len(), dropped, encoding.load(Ordering::Acquire));
+                  }''',
+                    'completion-fenced resource retirement and telemetry')
+
+          # 2) GPU MEMORY PRESSURE - never destroy an active texture or buffer.
+          # Reduce idle recycled cache size; trigger existing safe cache trimming when
+          # the accounted active texture + buffer bytes pass a soft threshold.
+          recycler='crates/glue5-gpu/src/recycle.rs'
+          exact(recycler, 'const MAX_BYTES: u64 = 32 << 20;', 'const MAX_BYTES: u64 = 8 << 20;', 'reduce recycled GPU cache 32 -> 8 MiB')
+          exact(recycler, 'const MAX_AGE: u64 = 1000;', 'const MAX_AGE: u64 = 256;', 'reduce retired cache lifetime')
+          exec_file='crates/glue5-gpu/src/exec.rs'
+          needle='        self.recycler.trim(self.epoch, &mut self.graveyard);'
+          replacement=f'''        // V8.5 soft threshold: only throw away idle *recreatable* caches.
+                  // Live allocations are never force-freed (would risk GPU use-after-free).
+                  if self.epoch.is_multiple_of(1024) {{
+                      let [tex, buf] = self.gpu_bytes();
+                      let live = tex.saturating_add(buf);
+                      log::info!("SN512A V8.5 GPU budget: live={{}}MiB of soft={{}}MiB, tex={{}}MiB buf={{}}MiB, objects={{}} epoch={{}}",
+                          live >> 20, {budget}, tex >> 20, buf >> 20, self.objs.len(), self.epoch);
+                      if live > ({budget}u64 << 20) {{
+                          self.trim();
+                      }}
+                  }}
+                  self.recycler.trim(self.epoch, &mut self.graveyard);'''
+          exact(exec_file,needle,replacement,'soft GPU high-water trigger and stats')
+
+          # 3) SHADER COMPATIBILITY - inspect compute workgroup size before creation.
+          # An invalid 1024-thread pipeline on the 512-thread Mali had already been
+          # rejected by wgpu validation; skip *only* statically provable unsupported
+          # literal workgroups instead of attempting unsupported dispatches.
+          ops='crates/glue5-gpu/src/ops.rs'
+          needle='''    let layout = device
+                  .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &program.layout_entries() });'''
+          replacement='''    // SN512A V8.5: GPU limit preflight, not a shader rewrite. Altering the
+              // algorithm's 1024-thread workgroup to 512 would give incorrect results.
+              let wgsl = program.text.get();
+              if let Some(after) = wgsl.split("@workgroup_size(").nth(1)
+                  && let Some(dims_text) = after.split(')').next()
+              {
+                  let mut dims = [1u32; 3];
+                  let mut literal = true;
+                  for (i, part) in dims_text.split(',').enumerate() {
+                      if i >= 3 { literal = false; break; }
+                      match part.trim().trim_end_matches('u').parse::<u32>() {
+                          Ok(v) => dims[i] = v,
+                          Err(_) => { literal = false; break; }
+                      }
+                  }
+                  let lim = device.limits();
+                  if literal && (dims[0] > lim.max_compute_workgroup_size_x
+                      || dims[1] > lim.max_compute_workgroup_size_y
+                      || dims[2] > lim.max_compute_workgroup_size_z
+                      || (dims[0] as u64 * dims[1] as u64 * dims[2] as u64)
+                          > lim.max_compute_invocations_per_workgroup as u64)
+                  {
+                      log::warn!("SN512A V8.5: skipped compute {} workgroup {:?}; device limits {:?}, max total {}",
+                          program.label, dims,
+                          [lim.max_compute_workgroup_size_x, lim.max_compute_workgroup_size_y, lim.max_compute_workgroup_size_z],
+                          lim.max_compute_invocations_per_workgroup);
+                      return None;
+                  }
+              }
+              let layout = device
+                  .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &program.layout_entries() });'''
+          exact(ops,needle,replacement,'unsupported WGSL compute workgroup filter')
+
+          # Preserve the crash-time host log even after the app is restarted.
+          # V8.2 normally renames host.log at next start, which can overwrite the only
+          # record of the GPU loss; host-crash.log is a bounded <=4MiB frozen copy.
+          exact('crates/glue5/src/sn512a_diag.rs',
+                r'let _ = fs::write(dir.join("last-failure.txt"), format!("{reason}\n"));',
+                r'let _ = fs::write(dir.join("last-failure.txt"), format!("{reason}\n"));' + '\n    let _ = fs::copy(dir.join("host.log"), dir.join("host-crash.log"));',
+                'retain crash-time Vulkan error log across application restarts')
+
+          checks=[
+            ('crates/glue5-gpu/src/exec.rs','SN512A V8.5 GPU budget:'),
+            ('crates/glue5-gpu/src/ops.rs','SN512A V8.5: skipped compute'),
+            ('crates/glue5-gpu/src/recycle.rs','const MAX_BYTES: u64 = 8 << 20;'),
+          ]
+          if policy == 'strict':
+              checks.append((submit,'SN512A V8.5 GPU lifetimes:'))
+          for file,mark in checks:
+              assert mark in Path(file).read_text(), f'patch not persisted: {file}'
+
+          report = {
+           'status':'UNCOMPILED SOURCE EXPERIMENT, NOT A CONFIRMED DEVICE-LOST FIX',
+           'sync_policy':policy,'gpu_soft_budget_mb':budget,'changes':changes,
+           'safety':'no force-deletion of active GPU objects, 768MiB resource heap remains a SOFT streaming target',
+           'notes':'Unsupported literal compute workgroups skipped, not retiled; unknown game.wasm shader index remains unsupported.'}
+          report_dir=Path(os.environ['RUNNER_TEMP'])/'v85-audit'
+          report_dir.mkdir(exist_ok=True,parents=True)
+          (report_dir/'resource-and-shader-patch.json').write_text(json.dumps(report,indent=2)+'\n')
+          for file in [submit,recycler,exec_file,ops]:
+              p=Path(file)
+              (report_dir / (p.name+'.sha256')).write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'\n')
+          print(json.dumps(report,indent=2))
+          PY_SN512A_V85
+          git diff --check
+          echo 'V8.5 GPU lifetime+memory+compute changes applied; full Android compilation is next.'
+      - name: Save V8.5 source-change audit (without game files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SN512A-V8.5-Vulkan-memory-shader-audit-${{ inputs.sync_policy }}
+          path: ${{ runner.temp }}/v85-audit/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Fix Mali packaging - require core libs, include Adreno hooks only when present
+        run: |
+          set -euo pipefail
+          # GLUE 5's upstream packager blindly links five .so files. Our last
+          # builds completed Rust compilation but failed to find optional
+          # libadrenotools.so and libhook_impl.so. Mali-G57 uses system Vulkan.
+          # Preserve core native libraries and only bundle AdrenoTools if its
+          # three dynamically-loaded libraries were actually produced.
+          python3 - <<'PY_SN512A_MALI_PACKAGE'
+          from pathlib import Path
+          p = Path('.mise/tasks/android/lib.sh')
+          if not p.is_file():
+              raise SystemExit('Missing GLUE 5 Android packaging script; source layout changed')
+          src = p.read_text()
+          old = '''    local lib
+              for lib in glue5 SDL3 adrenotools hook_impl main_hook; do
+                  ln -f "target/$target/release/lib$lib.so" "$out/jniLibs/$abi/"
+              done'''
+          new = '''    # SN512A/Mali: core runtime and SDL libraries are mandatory.
+              # AdrenoTools is dynamically loaded only for a user-selected driver.
+              local lib
+              for lib in glue5 SDL3; do
+                  if [ ! -s "target/$target/release/lib$lib.so" ]; then
+                      die "Required Android library missing: lib$lib.so"
+                  fi
+                  ln -f "target/$target/release/lib$lib.so" "$out/jniLibs/$abi/"
+              done
+              local missing_optional=()
+              for lib in adrenotools hook_impl main_hook; do
+                  if [ ! -s "target/$target/release/lib$lib.so" ]; then
+                      missing_optional+=("lib$lib.so")
+                  fi
+              done
+              if [ ${#missing_optional[@]} -eq 0 ]; then
+                  for lib in adrenotools hook_impl main_hook; do
+                      ln -f "target/$target/release/lib$lib.so" "$out/jniLibs/$abi/"
+                  done
+                  echo "Optional AdrenoTools complete; bundled all three libraries."
+              else
+                  echo "Mali system-driver build: skipped incomplete optional AdrenoTools: ${missing_optional[*]}"
+                  echo 'Custom Adreno driver selection is not available in this APK.'
+              fi'''
+          if src.count(old) != 1:
+              raise SystemExit('Upstream Android library list changed; refusing an unverified modification')
+          p.write_text(src.replace(old, new, 1))
+          print('Fixed packager: core libraries required, optional AdrenoTools must be complete.')
+          PY_SN512A_MALI_PACKAGE
+          bash -n .mise/tasks/android/lib.sh
+          git diff --check
+          git diff -- .mise/tasks/android/lib.sh
+          echo "GLUE 5 upstream commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: V8.6 - Profile actual Android CPU thread scheduling (no root or ADB)
+        env:
+          V86_ENCODER_WORKERS: ${{ inputs.encoder_workers }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/sn512a_v86.py <<'PY_V86'
+          from pathlib import Path
+          import os
+          p=Path('crates/glue5/src/sn512a_diag.rs')
+          src=p.read_text()
+          anchor='log::info!("SN512A V8.2 diagnostics active; GPU errors mirrored to Android/data/local.glue5/files/logs/host.log");'
+          if src.count(anchor)!=1:
+              raise SystemExit('V8.5 diagnostic init anchor changed; no patch applied')
+          src=src.replace(anchor,anchor+'\n                      sn512a_start_cpu_sampler();',1)
+          # Android bionic defines _SC_CLK_TCK = 6 (do not use Linux/glibc's 2).
+          sampler = r'''
+          // V8.6: read our OWN process /proc/self/task/<tid>/stat every 10 seconds.
+          // This uses no privileged process tracing. 'cpu' is the last scheduled
+          // core at the snapshot, not proof the thread exclusively ran on that core.
+          #[cfg(target_os = "android")]
+          fn sn512a_cpu_snapshot() -> std::collections::HashMap<u32, (String, u64, u32)> {
+              let mut tasks = std::collections::HashMap::new();
+              let Ok(dir) = std::fs::read_dir("/proc/self/task") else { return tasks; };
+              for entry in dir.flatten() {
+                  let Some(tid) = entry.file_name().to_string_lossy().parse::<u32>().ok() else { continue };
+                  let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
+                  let Some(open) = stat.find('(') else { continue };
+                  let Some(close) = stat.rfind(')') else { continue };
+                  if close <= open { continue; }
+                  let name = stat[open+1..close].replace(',', "_").replace('"', "_");
+                  let rest: Vec<_> = stat[close+1..].split_whitespace().collect();
+                  // Index 0 is Linux stat field 3 (state), utime/stime fields 14/15;
+                  // processor field 39 is only a recent CPU-placement snapshot.
+                  if rest.len() <= 36 { continue; }
+                  let Some(utime) = rest[11].parse::<u64>().ok() else { continue; };
+                  let Some(stime) = rest[12].parse::<u64>().ok() else { continue; };
+                  let Some(cpu) = rest[36].parse::<u32>().ok() else { continue; };
+                  tasks.insert(tid, (name, utime.saturating_add(stime), cpu));
+              }
+              tasks
+          }
+
+          #[cfg(target_os = "android")]
+          fn sn512a_start_cpu_sampler() {
+              let _ = std::thread::Builder::new().name("sn512a-cpu-probe".into()).spawn(|| {
+                  use std::io::Write;
+                  use std::time::{Duration, Instant};
+                  #[link(name = "c")]
+                  unsafe extern "C" { fn sysconf(name: std::os::raw::c_int) -> std::os::raw::c_long; }
+                  const BIONIC_SC_CLK_TCK: std::os::raw::c_int = 6;
+                  let hz = unsafe { sysconf(BIONIC_SC_CLK_TCK) };
+                  let hz = if hz > 0 { hz as f64 } else { 100.0 };
+                  let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+                  let mut previous = sn512a_cpu_snapshot();
+                  let mut previous_at = Instant::now();
+                  let mut csv = log_dir().and_then(|d| std::fs::File::create(d.join("cpu-scheduler.csv")).ok());
+                  if let Some(f) = csv.as_mut() {
+                      let _ = f.write_all(b"elapsed_s,tid,thread,core_pct,last_cpu,live_threads\n");
+                  }
+                  log::info!("SN512A V8.6 CPU scheduler profiler started: available logical cores={cores}, clock_ticks_per_second={hz}, sample=10s; last_cpu is a snapshot, not affinity");
+                  loop {
+                      std::thread::sleep(Duration::from_secs(10));
+                      let now = Instant::now();
+                      let elapsed = now.duration_since(previous_at).as_secs_f64().max(0.001);
+                      let current = sn512a_cpu_snapshot();
+                      let mut rows: Vec<(u32, String, f64, u32)> = Vec::new();
+                      for (&tid, (name, ticks, last_cpu)) in &current {
+                          if let Some((_, old_ticks, _)) = previous.get(&tid) {
+                              let delta = ticks.saturating_sub(*old_ticks);
+                              if delta > 0 {
+                                  let pct = 100.0 * (delta as f64) / (hz * elapsed);
+                                  rows.push((tid, name.clone(), pct, *last_cpu));
+                              }
+                          }
+                      }
+                      rows.sort_by(|a,b| b.2.total_cmp(&a.2));
+                      let sum_pct: f64 = rows.iter().map(|v| v.2).sum();
+                      let top = rows.iter().take(8).map(|(tid,n,p,c)| format!("{tid}/{n}={p:.0}%@CPU{c}")).collect::<Vec<_>>().join(" | ");
+                      log::info!("SN512A V8.6 CPU scheduler: logical_cores={cores}, threads={}, active_threads={}, process_cpu={sum_pct:.0}% (100%=one fully busy core), last_cpu snapshots; top: {top}", current.len(), rows.len());
+                      if let Some(f) = csv.as_mut() {
+                          for (tid,n,p,c) in &rows {
+                              let _ = writeln!(f, "{elapsed:.3},{tid},{n},{p:.2},{c},{}", current.len());
+                          }
+                          let _ = f.flush();
+                      }
+                      previous = current;
+                      previous_at = now;
+                  }
+              });
+          }
+          '''
+          # Insert right before the failure handler, preserving the existing logger.
+          marker='''/// Copy only the last 1 MiB of the private game.log after a failure.'''
+          if src.count(marker)!=1:
+              raise SystemExit('V8.5 diagnostic module marker changed; no patch applied')
+          src=src.replace(marker,sampler+'\n'+marker,1)
+          p.write_text(src)
+          # Keep proven GPU epoch and queue settings UNCHANGED unless opt-in 2 workers.
+          workers=int(os.environ['V86_ENCODER_WORKERS'])
+          if workers not in (1,2): raise SystemExit('encoder_workers must be 1 or 2')
+          submit=Path('crates/glue5-gpu/src/submit.rs')
+          s=submit.read_text()
+          tag='const ENCODE_THREADS: usize = 1;'
+          if s.count(tag)!=1: raise SystemExit('strict V8.5 1-thread encoding not found: must select sync_policy=strict')
+          if workers==2:
+              submit.write_text(s.replace(tag,'const ENCODE_THREADS: usize = 2;',1))
+          else:
+              assert s.count(tag)==1
+          print('V8.6 CPU profiler added; native encoder workers=', workers)
+          print('NO changes to FRAMES_IN_FLIGHT=1, GPU completion lifetimes, cache policy, streaming budget or Vulkan command pools.')
+          PY_V86
+          # V8.7 R1 fail-closed one-worker invariant; reject any invalid workflow dispatch.
+          if [ "${{ inputs.encoder_workers }}" != "1" ]; then echo 'R1 requires 1 encoder worker' >&2; exit 1; fi
+          python3 -m py_compile /tmp/sn512a_v86.py
+          python3 /tmp/sn512a_v86.py
+          grep -Fq 'fn sn512a_start_cpu_sampler()' crates/glue5/src/sn512a_diag.rs
+          grep -Fq 'SN512A V8.6 CPU scheduler' crates/glue5/src/sn512a_diag.rs
+          grep -Fq 'const FRAMES_IN_FLIGHT: usize = 1;' crates/glue5-gpu/src/submit.rs
+          grep -Fq 'const PENDING: usize = 4;' crates/glue5-gpu/src/submit.rs
+          git diff --check
+          echo 'V8.6 CPU sampling builds on V8.5; Android/data/local.glue5/files/logs/cpu-scheduler.csv; no privileged Android features required.' >> "$GITHUB_STEP_SUMMARY"
+      - name: V8.7 R2 - Export logs and CPU/crash data to public Documents/GLUE5-Logs
+        run: |
+          set -euo pipefail
+          cat > /tmp/sn512a_docs_patch.py <<'PY_PUBLIC_DOCS_PATCH'
+          from pathlib import Path
+
+          def replace_exact(file: str, old: str, new: str, label: str) -> None:
+              path = Path(file)
+              src = path.read_text()
+              count = src.count(old)
+              if count != 1:
+                  raise SystemExit(f'ABORT Documents patch: {label}: anchor count={count}, expected 1')
+              path.write_text(src.replace(old,new,1))
+
+          replace_exact('crates/glue5/Cargo.toml',
+              'android_logger = { version = "0.15", default-features = false }',
+              'android_logger = { version = "0.15", default-features = false }\n# Android scoped-storage public Documents logging.\njni = { version = "0.21", default-features = false }',
+              'Android-only JNI dependency')
+          replace_exact('crates/glue5/src/lib.rs',
+              '#[cfg(target_os = "android")]\nmod sn512a_diag;',
+              '#[cfg(target_os = "android")]\nmod sn512a_diag;\n#[cfg(target_os = "android")]\nmod sn512a_public_docs;',
+              'Android-only public-Documents module registration')
+          p='crates/glue5/src/sn512a_diag.rs'
+          # Only replace the end of Log::log; this keeps exactly one closing brace.
+          replace_exact(p,
+              '''    }
+              fn flush(&self) {''',
+              '''        crate::sn512a_public_docs::host(&line);
+              }
+              fn flush(&self) {''',
+              'mirror all host.log lines into public Documents')
+          replace_exact(p,
+              '    let output = path.as_ref().and_then(|p| File::create(p).ok());',
+              '    crate::sn512a_public_docs::init();\n    let output = path.as_ref().and_then(|p| File::create(p).ok());',
+              'create public Documents log files before main logger')
+          replace_exact(p,
+              'log::info!("SN512A V8.2 diagnostics active; GPU errors mirrored to Android/data/local.glue5/files/logs/host.log");',
+              'log::info!("SN512A V8.2 diagnostics active; GPU errors mirrored to Android/data/local.glue5/files/logs/host.log");\n                      log::info!("SN512A V8.7 R2 PUBLIC Documents/GLUE5-Logs export active={}", crate::sn512a_public_docs::enabled());',
+              'log public folder status')
+          replace_exact(p,
+              'log::error!("SN512A V8.2 game stopped: {reason}");',
+              'log::error!("SN512A V8.2 game stopped: {reason}");\n    crate::sn512a_public_docs::failed(reason);',
+              'export last failure and crash log')
+          replace_exact(p,
+              'let mut csv = log_dir().and_then(|d| std::fs::File::create(d.join("cpu-scheduler.csv")).ok());',
+              'let mut csv = log_dir().and_then(|d| std::fs::File::create(d.join("cpu-scheduler.csv")).ok()).map(Sn512aCsvTee);',
+              'CPU CSV tee writer')
+          tee='''
+                    // Mirrors CSV output to public Documents while preserving private logs.
+                    #[cfg(target_os = "android")]
+                    struct Sn512aCsvTee(std::fs::File);
+                    #[cfg(target_os = "android")]
+                    impl std::io::Write for Sn512aCsvTee {
+                        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                            let n = self.0.write(bytes)?;
+                            crate::sn512a_public_docs::cpu(&bytes[..n]);
+                            Ok(n)
+                        }
+                        fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+                    }
+                    '''
+          replace_exact(p,
+              '#[cfg(target_os = "android")]\nfn sn512a_start_cpu_sampler() {',
+              tee+'\n#[cfg(target_os = "android")]\nfn sn512a_start_cpu_sampler() {',
+              'native CPU CSV tee')
+          replace_exact(p,
+              '        let mut previous_at = Instant::now();',
+              '        let mut previous_at = Instant::now();\n        let mut last_game_tail_export = Instant::now();',
+              'initialize bounded game tail periodic export')
+          replace_exact(p,
+              '            previous = current;',
+              '            if last_game_tail_export.elapsed() >= Duration::from_secs(60) {\n                crate::sn512a_public_docs::snapshot_game_tail();\n                last_game_tail_export = Instant::now();\n            }\n            previous = current;',
+              'periodic game tail export')
+          src=Path(p).read_text()
+          for mark in ('crate::sn512a_public_docs::init();','crate::sn512a_public_docs::host(&line);',
+                      'crate::sn512a_public_docs::failed(reason);','map(Sn512aCsvTee)',
+                      'crate::sn512a_public_docs::snapshot_game_tail();'):
+              assert mark in src, mark
+          print('R2: Documents public export patches inserted; private diagnostics retained.')
+          PY_PUBLIC_DOCS_PATCH
+          python3 /tmp/sn512a_docs_patch.py
+          cat > crates/glue5/src/sn512a_public_docs.rs <<'RUST_SN512A_PUBLIC_DOCS'
+          //! SN512A: mirror existing GLUE 5 diagnostics to the user's PUBLIC Documents folder.
+          //! Android 10+ scoped storage: MediaStore.Files + RELATIVE_PATH, never raw
+          //! /storage/emulated/0 writes, MANAGE_EXTERNAL_STORAGE, root, or ADB.
+          //! Session-specific names preserve earlier crash reports after relaunch.
+          use std::fs::{self, File};
+          use std::io::{Read, Seek, SeekFrom, Write};
+          use std::os::fd::FromRawFd;
+          use std::sync::{Mutex, OnceLock};
+          use std::time::{SystemTime, UNIX_EPOCH};
+          use jni::objects::{JObject, JValue};
+          use jni::JNIEnv;
+
+          const DIR: &str = "Documents/GLUE5-Logs/";
+          const GAME_TAIL_LIMIT: u64 = 1024 * 1024;
+
+          #[link(name = "SDL3")]
+          unsafe extern "C" {
+              fn SDL_GetAndroidJNIEnv() -> *mut std::ffi::c_void;
+              fn SDL_GetAndroidActivity() -> *mut std::ffi::c_void;
+          }
+          unsafe extern "C" {
+              fn dup(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+          }
+
+          struct PublicFiles {
+              host: Option<File>,
+              cpu: Option<File>,
+              reason: Option<File>,
+              tail: Option<File>,
+              crash: Option<File>,
+              previous: Option<File>,
+          }
+          static FILES: OnceLock<Mutex<PublicFiles>> = OnceLock::new();
+
+          fn put_string<'a>(env: &mut JNIEnv<'a>, values: &JObject<'a>, key: &str, value: &str) -> Result<(), String> {
+              let k = JObject::from(env.new_string(key).map_err(|e| e.to_string())?);
+              let v = JObject::from(env.new_string(value).map_err(|e| e.to_string())?);
+              env.call_method(values, "put", "(Ljava/lang/String;Ljava/lang/String;)V",
+                  &[JValue::Object(&k), JValue::Object(&v)])
+                  .map_err(|e| format!("ContentValues.put({key}): {e}"))?;
+              Ok(())
+          }
+
+          fn create<'a>(env: &mut JNIEnv<'a>, resolver: &JObject<'a>, collection: &JObject<'a>, filename: &str) -> Result<File, String> {
+              let values = env.new_object("android/content/ContentValues", "()V", &[])
+                  .map_err(|e| e.to_string())?;
+              put_string(env, &values, "_display_name", filename)?;
+              put_string(env, &values, "mime_type", if filename.ends_with(".csv") { "text/csv" } else { "text/plain" })?;
+              put_string(env, &values, "relative_path", DIR)?;
+              let uri = env.call_method(resolver, "insert", "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+                  &[JValue::Object(collection), JValue::Object(&values)])
+                  .map_err(|e| format!("MediaStore insert {filename}: {e}"))?
+                  .l().map_err(|e| e.to_string())?;
+              if uri.is_null() { return Err(format!("MediaStore returned null for {filename}")); }
+              let mode = JObject::from(env.new_string("w").map_err(|e| e.to_string())?);
+              let pfd = env.call_method(resolver, "openFileDescriptor", "(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;",
+                  &[JValue::Object(&uri), JValue::Object(&mode)])
+                  .map_err(|e| format!("MediaStore open {filename}: {e}"))?
+                  .l().map_err(|e| e.to_string())?;
+              if pfd.is_null() { return Err(format!("MediaStore returned null descriptor for {filename}")); }
+              let java_fd = env.call_method(&pfd, "getFd", "()I", &[])
+                  .and_then(|v| v.i()).map_err(|e| e.to_string())?;
+              // Dup BEFORE closing the Java ParcelFileDescriptor. Rust owns only the dup.
+              let own_fd = unsafe { dup(java_fd) };
+              let _ = env.call_method(&pfd, "close", "()V", &[]);
+              if own_fd < 0 { return Err(format!("dup(MediaStore fd) failed for {filename}")); }
+              Ok(unsafe { File::from_raw_fd(own_fd) })
+          }
+
+          pub(crate) fn init() {
+              // Called on the SDL-initialized Android UI/game thread, not from a detached
+              // sampler thread. SDL supplies an already-attached JNIEnv and Activity.
+              let result: Result<(PublicFiles, String), String> = (|| {
+                  let env_ptr = unsafe { SDL_GetAndroidJNIEnv() };
+                  let act_ptr = unsafe { SDL_GetAndroidActivity() };
+                  if env_ptr.is_null() || act_ptr.is_null() { return Err("SDL JNI/activity unavailable".into()); }
+                  let mut env = unsafe { JNIEnv::from_raw(env_ptr.cast()) }.map_err(|e| e.to_string())?;
+                  let activity = unsafe { JObject::from_raw(act_ptr.cast()) };
+                  let resolver = env.call_method(&activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+                      .map_err(|e| format!("getContentResolver: {e}"))?
+                      .l().map_err(|e| e.to_string())?;
+                  // SDL_GetAndroidActivity returns a local reference: release our copy.
+                  env.delete_local_ref(activity).map_err(|e| e.to_string())?;
+                  let volume = JObject::from(env.new_string("external_primary").map_err(|e| e.to_string())?);
+                  let collection = env.call_static_method("android/provider/MediaStore$Files", "getContentUri",
+                      "(Ljava/lang/String;)Landroid/net/Uri;", &[JValue::Object(&volume)])
+                      .map_err(|e| format!("MediaStore.Files.getContentUri: {e}"))?
+                      .l().map_err(|e| e.to_string())?;
+                  let session = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                  let prefix = format!("SN512A-{session}");
+                  let mut file = |suffix: &str| -> Option<File> {
+                      let name = format!("{prefix}-{suffix}");
+                      match create(&mut env, &resolver, &collection, &name) {
+                          Ok(f) => Some(f),
+                          Err(e) => { eprintln!("SN512A public Documents export: {e}"); None }
+                      }
+                  };
+                  let mut docs = PublicFiles {
+                      host: file("host.log"),
+                      cpu: file("cpu-scheduler.csv"),
+                      reason: file("last-failure.txt"),
+                      tail: file("game-tail.log"),
+                      crash: file("host-crash.log"),
+                      previous: file("host-previous.log"),
+                  };
+                  if docs.host.is_none() || docs.cpu.is_none() {
+                      return Err("could not create host.log and cpu-scheduler.csv in Documents".into());
+                  }
+                  let mut readme = file("README.txt");
+                  if let Some(f) = readme.as_mut() {
+                      let _ = writeln!(f, "SN512A GLUE 5 session {session}");
+                      let _ = writeln!(f, "Public folder: {DIR}");
+                      let _ = writeln!(f, "All session files share prefix {prefix}-");
+                      let _ = writeln!(f, "host.log: live GPU and engine log; cpu-scheduler.csv: 10-second thread snapshots");
+                      let _ = writeln!(f, "game-tail.log: latest 1 MiB of game.log (updated every 60 s and upon failure)");
+                      let _ = writeln!(f, "last-failure.txt / host-crash.log: filled if game reports an error");
+                      let _ = writeln!(f, "Never upload your private game.wasm or 20 GB game assets.");
+                      let _ = f.flush();
+                  }
+                  // Carry over the previous run's last host log if available.
+                  if let Some(dst) = docs.previous.as_mut() {
+                      if let Some(root) = crate::paths::android_external_dir() {
+                          if let Ok(mut src) = File::open(root.join("logs/host-previous.log")) {
+                              let _ = std::io::copy(&mut src, dst);
+                              let _ = dst.flush();
+                          }
+                      }
+                  }
+                  Ok((docs, prefix))
+              })();
+              match result {
+                  Ok((files, name)) => {
+                      let _ = FILES.set(Mutex::new(files));
+                      // Before the main logger is initialized, write only to logcat/stderr.
+                      eprintln!("SN512A Documents export ACTIVE: {DIR} prefix {name}");
+                  }
+                  Err(e) => {
+                      eprintln!("SN512A Documents export UNAVAILABLE ({e}); app-private logging remains active");
+                  }
+              }
+          }
+
+          pub(crate) fn enabled() -> bool { FILES.get().is_some() }
+
+          pub(crate) fn host(line: &str) {
+              if let Some(files) = FILES.get() {
+                  if let Ok(mut docs) = files.lock() {
+                      if let Some(f) = docs.host.as_mut() {
+                          let _ = f.write_all(line.as_bytes());
+                          let _ = f.flush(); // Preserve the error even on an abrupt GPU failure.
+                      }
+                  }
+              }
+          }
+
+          pub(crate) fn cpu(bytes: &[u8]) {
+              if let Some(files) = FILES.get() {
+                  if let Ok(mut docs) = files.lock() {
+                      if let Some(f) = docs.cpu.as_mut() {
+                          let _ = f.write_all(bytes);
+                          let _ = f.flush();
+                      }
+                  }
+              }
+          }
+
+          pub(crate) fn snapshot_game_tail() {
+              let Some(files) = FILES.get() else { return; };
+              let Ok(user_dir) = crate::paths::user_dir() else { return; };
+              let Ok(mut src) = File::open(user_dir.join("game.log")) else { return; };
+              let Ok(len) = src.metadata().map(|m| m.len()) else { return; };
+              if src.seek(SeekFrom::Start(len.saturating_sub(GAME_TAIL_LIMIT))).is_err() { return; }
+              if let Ok(mut docs) = files.lock() {
+                  if let Some(dst) = docs.tail.as_mut() {
+                      // Only this bounded snapshot is exposed. Do not copy 20 GB assets.
+                      if dst.set_len(0).is_err() || dst.seek(SeekFrom::Start(0)).is_err() { return; }
+                      let _ = std::io::copy(&mut src.take(GAME_TAIL_LIMIT), dst);
+                      let _ = dst.flush();
+                  }
+              }
+          }
+
+          pub(crate) fn failed(reason: &str) {
+              snapshot_game_tail();
+              let Some(files) = FILES.get() else { return; };
+              let Ok(mut docs) = files.lock() else { return; };
+              if let Some(f) = docs.reason.as_mut() {
+                  let _ = writeln!(f, "{reason}");
+                  let _ = f.flush();
+              }
+              let Some(root) = crate::paths::android_external_dir() else { return; };
+              if let Ok(mut src) = File::open(root.join("logs/host.log")) {
+                  if let Some(f) = docs.crash.as_mut() {
+                      let _ = std::io::copy(&mut src, f);
+                      let _ = f.flush();
+                  }
+              }
+          }
+          RUST_SN512A_PUBLIC_DOCS
+          grep -Fq 'jni = { version = "0.21"' crates/glue5/Cargo.toml
+          grep -Fq 'SN512A V8.7 R2 PUBLIC' crates/glue5/src/sn512a_diag.rs
+          grep -Fq 'MediaStore$Files' crates/glue5/src/sn512a_public_docs.rs
+          git diff --check
+          echo 'V8.7 R2: live host/CPU logs and bounded game-tail/crash data copied to public Documents/GLUE5-Logs via MediaStore, without root, ADB, or storage permission. App-private logs remain.' >> "$GITHUB_STEP_SUMMARY"
+      - name: V8.7 - CPU recording/state fastpaths + safe encoder worker A-B
+        env:
+          V87_FASTPATHS: ${{ inputs.cpu_fastpaths }}
+          V87_WORKERS: ${{ inputs.encoder_workers }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/sn512a_v87.py <<'PY_V87'
+          #!/usr/bin/env python3
+          """V8.7 narrowly-scoped CPU optimization on top of V8.6 (GLUE5).
+          
+          1) Skip pipeline-dirty work when OM render targets have not changed.
+          2) Keep a three-entry (VS/PS/CS) hot bind-group lookup cache. This DOES NOT
+             bypass hash-map generation checks, after age or memory-pressure eviction.
+          3) Optional second *CPU* command-encoding worker is applied by the V8.6 step.
+          
+          Never delete live resources; don't alter wgpu submissions, GPU epochs, frames in
+          flight, command-pool policy, streaming/heap budget or shader compatibility.
+          Fail closed if source no longer matches the previously inspected structure.
+          """
+          from pathlib import Path
+          import hashlib, json, os
+          
+          on = os.environ['V87_FASTPATHS'].strip().lower()
+          if on not in ('yes', 'no'):
+              raise SystemExit('cpu_fastpaths must be yes or no')
+          
+          def replace_one(path:Path, old:str, new:str, label:str):
+              s=path.read_text()
+              count=s.count(old)
+              if count!=1:
+                  raise SystemExit(f'Version mismatch in {path}, {label}: expected exactly 1 source anchor, found {count}')
+              path.write_text(s.replace(old,new,1))
+          
+          results={'cpu_fastpaths':on,'worker_count':int(os.environ['V87_WORKERS']), 'changes': []}
+          if results['worker_count'] not in (1,2): raise SystemExit('invalid encoder worker count')
+          submit=Path('crates/glue5-gpu/src/submit.rs')
+          submit_data=submit.read_text()
+          for m in ['const FRAMES_IN_FLIGHT: usize = 1;',
+                    'const PENDING: usize = 4;',
+                    'SN512A V8.5 GPU lifetimes:']:
+              if m not in submit_data:
+                  raise SystemExit(f'Missing stable GPU synchronization invariant: {m}')
+          if submit_data.count(f'const ENCODE_THREADS: usize = {results["worker_count"]};')!=1:
+              raise SystemExit('Encoder worker setting missing; V8.6 patch did not apply')
+          
+          if on=='yes':
+              # A safe D3D11 state-equivalence fast path: same RT IDs, subresources,
+              # formats, depth flags => same pipeline. The original handler had no side
+              # effects besides mutating these state fields + setting pdirty.
+              execf=Path('crates/glue5-gpu/src/exec.rs')
+              old='''            op::SET_RENDER_TARGETS => {
+                          for i in 0..8 {
+                              self.s.rt[i] =
+                                  Target { tex: c.w(i * 4), mip: c.w(i * 4 + 1), slice: c.w(i * 4 + 2), format: c.w(i * 4 + 3) };
+                          }
+                          self.s.ds = Target { tex: c.w(32), mip: c.w(33), slice: c.w(34), format: c.w(35) };
+                          self.s.ds_flags = c.w(36);
+                          self.pdirty = true;
+                      }'''
+              new='''            op::SET_RENDER_TARGETS => {
+                          // V8.7: the engine repeats OM target bindings frequently.
+                          // Mark pipelines dirty only if attachment *identity* changes.
+                          // No change to render-pass flush, hazards or GPU ordering.
+                          let previous_rt = self.s.rt;
+                          let previous_ds = self.s.ds;
+                          let previous_flags = self.s.ds_flags;
+                          for i in 0..8 {
+                              self.s.rt[i] =
+                                  Target { tex: c.w(i * 4), mip: c.w(i * 4 + 1), slice: c.w(i * 4 + 2), format: c.w(i * 4 + 3) };
+                          }
+                          self.s.ds = Target { tex: c.w(32), mip: c.w(33), slice: c.w(34), format: c.w(35) };
+                          self.s.ds_flags = c.w(36);
+                          if previous_rt != self.s.rt || previous_ds != self.s.ds || previous_flags != self.s.ds_flags {
+                              self.pdirty = true;
+                          } else {
+                              self.stats.sn512a_redundant_rt += 1;
+                          }
+                      }'''
+              replace_one(execf,old,new,'RT state equivalence')
+              replace_one(execf,'    pub errors: u64,',
+                         '    pub errors: u64,\n    /// V8.7: repeated identical OM bindings that did not dirty a pipeline.\n    pub sn512a_redundant_rt: u64,',
+                         'render-target fast-path telemetry')
+              results['changes']+=['deduplicate identical SET_RENDER_TARGETS without changing render pass/attachment IDs']
+          
+              # Source in GLUE5 has already cached all the expensive wgpu handles in
+              # two generations. This avoids repeated FxHashMap hashing on *identical*
+              # groups when VS/PS/CS alternate within a draw. Invalidate hot handles on
+              # generation rotation or pressure release so stale resources aren't pinned.
+              draw=Path('crates/glue5-gpu/src/draw.rs')
+              replace_one(draw,'''pub struct BindCache {
+              current: ''','''pub struct BindCache {
+              // SN512A V8.7: one frequently repeated group per shader stage.
+              // Cleared whenever bind-group generations are recycled/evicted.
+              hot: [Option<(Box<[u32]>, wgpu::BindGroup, u64)>; 3],
+              pub sn512a_hot_hits: u64,
+              pub sn512a_hot_lookups: u64,
+              current: ''','hot bind group fields')
+              old='''    fn get(&mut self, key: &[u32]) -> Option<(wgpu::BindGroup, u64)> {
+                  if let Some(v) = self.current.get(key) {
+                      return Some(v.clone());
+                  }
+                  let (k, v) = self.old.remove_entry(key)?;
+                  self.current.insert(k, v.clone());
+                  Some(v)
+              }'''
+              new='''    fn get(&mut self, key: &[u32]) -> Option<(wgpu::BindGroup, u64)> {
+                  // All texture/sampler groups begin with (program ID, shader stage).
+                  // Keep the stage-specific hot lookup only as long as its generation.
+                  let stage = key.get(1).copied().unwrap_or(3) as usize;
+                  self.sn512a_hot_lookups += 1;
+                  if let Some(Some((hot_key, bg, serial))) = self.hot.get(stage) {
+                      if hot_key.as_ref() == key {
+                          self.sn512a_hot_hits += 1;
+                          return Some((bg.clone(), *serial));
+                      }
+                  }
+                  let found = if let Some(v) = self.current.get(key) {
+                      Some(v.clone())
+                  } else {
+                      let (k, v) = self.old.remove_entry(key)?;
+                      self.current.insert(k, v.clone());
+                      Some(v)
+                  };
+                  if let Some((bg, serial)) = &found {
+                      if let Some(slot) = self.hot.get_mut(stage) {
+                          *slot = Some((key.into(), bg.clone(), *serial));
+                      }
+                  }
+                  found
+              }'''
+              replace_one(draw,old,new,'fast bind cache lookups')
+              # When aging drops a previous cache generation, forget its hot handles too.
+              replace_one(draw,
+                 '    pub fn age(&mut self) -> BindGroups {\n        std::mem::replace(&mut self.old, std::mem::take(&mut self.current))',
+                 '    pub fn age(&mut self) -> BindGroups {\n        self.hot = Default::default();\n        std::mem::replace(&mut self.old, std::mem::take(&mut self.current))',
+                 'age cache invalidation')
+              replace_one(draw,
+                 '    pub fn take_old(&mut self) -> BindGroups {\n        std::mem::take(&mut self.old)',
+                 '    pub fn take_old(&mut self) -> BindGroups {\n        self.hot = Default::default();\n        std::mem::take(&mut self.old)',
+                 'pressure cache invalidation')
+              old='''        self.serial += 1;
+                  self.current.insert(key.into(), (bg, self.serial));'''
+              new='''        self.serial += 1;
+                  if dropped.is_some() { self.hot = Default::default(); }
+                  if let Some(slot) = self.hot.get_mut(key.get(1).copied().unwrap_or(3) as usize) {
+                      *slot = Some((key.into(), bg.clone(), self.serial));
+                  }
+                  self.current.insert(key.into(), (bg, self.serial));'''
+              replace_one(draw,old,new,'new bind cache inserts + promotion invalidation')
+              results['changes']+=['stage-specific hot bind cache, invalidated on age/memory pressure']
+          
+              # Report whether the fast paths *actually* help rather than claiming FPS.
+              # Insert into the existing V8.5 periodic GPU-budget diagnostic; all fields
+              # are owned by self, and reading them doesn't require thread synchronization.
+              # Only the one V8.5 flush-site exists; use its exact indentation.
+              text=execf.read_text()
+              actual='        self.recycler.trim(self.epoch, &mut self.graveyard);'
+              if text.count(actual)!=1: raise SystemExit('V8.5 recycler trim anchor missing')
+              performance='''        if self.epoch.is_multiple_of(1024) {
+                      log::info!("SN512A V8.7 CPU fastpaths: redundant_rt={} hot_groups={}/{}",
+                          self.stats.sn512a_redundant_rt,
+                          self.binds.sn512a_hot_hits, self.binds.sn512a_hot_lookups);
+                  }
+                  self.recycler.trim(self.epoch, &mut self.graveyard);'''
+              replace_one(execf, actual, performance, 'CPU fastpaths diagnostics')
+              results['changes']+=['periodic measured fast-path hit counts in host.log']
+          
+          results['changes'].append('encoder worker count selected in V8.6, GPU completion fences and strict in-flight frame cap retained')
+          checks={'crates/glue5-gpu/src/submit.rs':['const FRAMES_IN_FLIGHT: usize = 1;',
+                                                    'const PENDING: usize = 4;',
+                                                    'SN512A V8.5 GPU lifetimes:'],
+                  'crates/glue5-gpu/src/ops.rs':['SN512A V8.5: skipped compute'],
+                  'crates/glue5-gpu/src/recycle.rs':['const MAX_BYTES: u64 = 8 << 20;'],
+                  'crates/glue5-gpu/src/exec.rs':['SN512A V8.5 GPU budget:']}
+          if on=='yes':
+              checks['crates/glue5-gpu/src/draw.rs']=['SN512A V8.7: one frequently repeated group', 'self.hot = Default::default();']
+              checks['crates/glue5-gpu/src/exec.rs']+=['SN512A V8.7 CPU fastpaths:', 'sn512a_redundant_rt']
+          for f,marks in checks.items():
+              data=Path(f).read_text()
+              for m in marks:
+                  if m not in data: raise SystemExit(f'Missing post-patch invariant in {f}: {m}')
+          
+          report=Path(os.environ['RUNNER_TEMP'])/'v85-audit'
+          report.mkdir(parents=True,exist_ok=True)
+          (report/'v87-cpu-patch-report.json').write_text(json.dumps(results,indent=2)+'\n')
+          for name in ['crates/glue5-gpu/src/draw.rs','crates/glue5-gpu/src/exec.rs','crates/glue5-gpu/src/submit.rs']:
+              p=Path(name)
+              (report/(p.name+'.v87.sha256')).write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'\n')
+          print(json.dumps(results,indent=2))
+          PY_V87
+          python3 -m py_compile /tmp/sn512a_v87.py
+          python3 /tmp/sn512a_v87.py
+          git diff --check
+          git diff -- crates/glue5-gpu/src/submit.rs crates/glue5-gpu/src/exec.rs crates/glue5-gpu/src/draw.rs > "$RUNNER_TEMP/v85-audit/v87-graphics-cpu-changes.patch"
+          grep -Fq 'SN512A V8.5 GPU lifetimes:' crates/glue5-gpu/src/submit.rs
+          grep -Fq 'SN512A V8.5: skipped compute' crates/glue5-gpu/src/ops.rs
+          echo "V8.7: CPU fastpaths=${{ inputs.cpu_fastpaths }}; encoder workers=${{ inputs.encoder_workers }}; strict GPU synchronization still enabled." >> "$GITHUB_STEP_SUMMARY"
+      - name: V8.8 - Exact-hash shader recovery, missing-shader report, safe CPU render-pass optimization
+        run: |
+          set -euo pipefail
+          cat > /tmp/sn512a_v88_patch.py <<'PY_SN512A_V88'
+          #!/usr/bin/env python3
+          """V8.8: stable CPU draw-state tweaks and *exact-hash* missing shader recovery.
+
+          Only restores WGSL files whose ORIGINAL 64-bit shader hash exists in a
+          sibling build's index.json; never fabricates shader code, overwrites assets,
+          or changes GPU parallelism or resource lifetime policy.
+          """
+          from pathlib import Path
+          import os, hashlib, json
+
+          CHANGES = []
+          def replace_exact(file, old, new, label):
+              p=Path(file); s=p.read_text(); n=s.count(old)
+              if n!=1:
+                  raise SystemExit(f'V8.8 abort: {label}: expected exactly one source anchor in {file}, got {n}')
+              p.write_text(s.replace(old,new,1))
+              CHANGES.append({'file':file, 'description':label})
+
+          shader='crates/glue5-gpu/src/shader.rs'
+          # Recover *real* pretranslated WGSL from user-owned sibling build directories.
+          # A missing shader cannot be generated from its label or hash; never choose a
+          # lookalike effect or lower workgroup size without understanding the algorithm.
+          replace_exact(shader,
+          '''struct Entry {
+              label: String,
+              ok: bool,
+              consts: bool,
+              error: Option<String>,
+          }''',
+          '''struct Entry {
+              label: String,
+              ok: bool,
+              consts: bool,
+              error: Option<String>,
+              // SN512A V8.8: alternate *exact hash* WGSL source from a sibling pack.
+              source_dir: Option<PathBuf>,
+          }''',
+          'shader Entry source provenance')
+          replace_exact(shader,
+          '''                    error: v.get("error").and_then(|x| x.as_str()).map(String::from),
+                          },''',
+          '''                    error: v.get("error").and_then(|x| x.as_str()).map(String::from),
+                              source_dir: None,
+                          },''',
+          'initialize original shader entry source provenance')
+          replace_exact(shader,
+          '''        log::info!("gpu: {} translated shaders in {}", index.len(), dir.display());''',
+          '''        // Read-only recovery: existing user-owned alternate packs with matching
+                  // 64-bit shader hash+metadata can supply missing WGSL/constant tables.
+                  // No network, no APK-embedded game files, no invented shader programs.
+                  #[cfg(target_os = "android")]
+                  sn512a_recover_exact_shaders(dir, &mut index);
+                  log::info!("gpu: {} translated shaders in {}", index.len(), dir.display());''',
+          'activate exact shader asset recovery before program initialization')
+          replace_exact(shader,
+          '''        let source = std::fs::read_to_string(self.dir.join(format!("{name}.wgsl")))?;''',
+          '''        let source_root = entry.source_dir.as_deref().unwrap_or(&self.dir);
+                  let source = std::fs::read_to_string(source_root.join(format!("{name}.wgsl")))?;''',
+          'use recovered exact shader source where available')
+          replace_exact(shader,
+          '''            let json = std::fs::read_to_string(self.dir.join(format!("{name}.consts.json")))?;''',
+          '''            let json = std::fs::read_to_string(source_root.join(format!("{name}.consts.json")))?;''',
+          'use matching constants table from the same source')
+          helper=r'''
+          // SN512A V8.8: a shader translated for the same *bytecode hash* can be
+          // shared between the user's OWN copies of build-specific translated packs.
+          // Index labels must match if both packs have an entry. No shader substitutions
+          // by just an effect name (bindings may be incompatible), no modifications to
+          // game data, and no directory traversal outside the sibling `game/b/*` packs.
+          #[cfg(target_os = "android")]
+          fn sn512a_recover_exact_shaders(dir: &Path, index: &mut HashMap<u64, Entry>) {
+              let Some(build_dir) = dir.parent() else { return; };
+              let Some(b_root) = build_dir.parent() else { return; };
+              if dir.file_name() != Some(std::ffi::OsStr::new("shaders"))
+                  || b_root.file_name() != Some(std::ffi::OsStr::new("b")) {
+                  return;
+              }
+              let mut recovered_file = 0usize;
+              let mut recovered_index = 0usize;
+              let mut checked = 0usize;
+              let Ok(dirs) = std::fs::read_dir(b_root) else { return; };
+              for alt_dir in dirs.filter_map(Result::ok).map(|e| e.path()).take(16) {
+                  let alt = alt_dir.join("shaders");
+                  if alt == dir || !alt.is_dir() { continue; }
+                  let Ok(json_text) = std::fs::read_to_string(alt.join("index.json")) else { continue; };
+                  let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_text) else { continue; };
+                  let Some(entries) = json.as_object() else { continue; };
+                  checked += 1;
+                  for (key, meta) in entries {
+                      let Ok(hash) = u64::from_str_radix(key, 16) else { continue; };
+                      if !meta.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
+                      let filename = format!("{hash:016x}");
+                      if !alt.join(format!("{filename}.wgsl")).is_file() { continue; }
+                      let needs_consts = meta.get("consts").is_some();
+                      if needs_consts && !alt.join(format!("{filename}.consts.json")).is_file() { continue; }
+                      let name = |s: &str| meta.get(s).and_then(|v| v.as_str()).unwrap_or("");
+                      let label = format!("{}::{}", name("effect"), name("program"));
+                      if label == "::" { continue; }
+                      if let Some(original) = index.get_mut(&hash) {
+                          // Preserve the primary index's authoritative translation status;
+                          // never overwrite an explicitly failed translation or mismatched label.
+                          if original.ok && original.label == label && original.consts == needs_consts
+                              && original.source_dir.is_none()
+                              && !dir.join(format!("{filename}.wgsl")).is_file() {
+                              original.source_dir = Some(alt.clone());
+                              recovered_file += 1;
+                          }
+                      } else {
+                          index.insert(hash, Entry {
+                              label, ok: true, consts: needs_consts, error: None,
+                              source_dir: Some(alt.clone()),
+                          });
+                          recovered_index += 1;
+                      }
+                  }
+              }
+              let missing_wgsl = index.iter().filter(|(hash, entry)| {
+                  entry.ok && entry.source_dir.is_none()
+                      && !dir.join(format!("{hash:016x}.wgsl")).is_file()
+              }).count();
+              let missing_consts = index.iter().filter(|(hash, entry)| {
+                  entry.ok && entry.consts && entry.source_dir.is_none()
+                      && !dir.join(format!("{hash:016x}.consts.json")).is_file()
+              }).count();
+              log::info!("SN512A V8.8 shader audit: total_index={} sibling_packs={} exact_wgsl_recovered={} exact_index_recovered={} missing_wgsl={} missing_consts={} root={}",
+                  index.len(), checked, recovered_file, recovered_index,
+                  missing_wgsl, missing_consts, dir.display());
+              if missing_wgsl != 0 || missing_consts != 0 {
+                  log::warn!("SN512A V8.8: missing translated shader assets cannot be reconstructed from hashes; provide a COMPLETE matching translated shader pack. Do not substitute shaders by label.");
+              }
+          }
+
+          '''
+          replace_exact(shader, 'impl Library {\n    pub fn open(dir: &Path) -> Result<Library> {',
+                        helper+'impl Library {\n    pub fn open(dir: &Path) -> Result<Library> {',
+                        'exact hash-only alternate shader bundle resolver')
+
+          # CPU pass setup: avoid repeated geometric Vec reallocations (these temporary
+          # attachment/format vectors can grow from 0 to 8 every render pass).
+          # Keep all wgpu pass ordering and target semantics identical to the stable build.
+          draw='crates/glue5-gpu/src/draw.rs'
+          replace_exact(draw,
+          '''        let mut colors: Vec<Option<(wgpu::TextureView, Option<u32>, wgpu::LoadOp<wgpu::Color>)>> = Vec::new();
+                  let mut targets = Vec::new();''',
+          '''        // SN512A V8.8 CPU: reserve the fixed D3D11 maximum of 8 color targets
+                  // to avoid capacity growth/reallocation during every new render pass.
+                  let mut colors: Vec<Option<(wgpu::TextureView, Option<u32>, wgpu::LoadOp<wgpu::Color>)>> = Vec::with_capacity(8);
+                  let mut targets = Vec::with_capacity(8);''',
+          'pre-reserve render target vectors, 8 attachments')
+
+          # Public Documents: write an easy-to-upload shader-only fault inventory,
+          # in addition to full host.log and CPU scheduler CSV. This contains no assets.
+          docs='crates/glue5/src/sn512a_public_docs.rs'
+          replace_exact(docs,
+          '''    previous: Option<File>,
+          }''',
+          '''    previous: Option<File>,
+              shader_report: Option<File>,
+          }''',
+          'add shader-only report to Documents exporter')
+          replace_exact(docs,
+          '''            previous: file("host-previous.log"),
+                  };''',
+          '''            previous: file("host-previous.log"),
+                      shader_report: file("shaders-missing.txt"),
+                  };''',
+          'create Documents shaders-missing.txt')
+          replace_exact(docs,
+          '''            let _ = writeln!(f, "Never upload your private game.wasm or 20 GB game assets.");''',
+          '''            let _ = writeln!(f, "shaders-missing.txt: translated shader inventory, unavailable hashes, and compilation issues");
+                      let _ = writeln!(f, "Never upload your private game.wasm or 20 GB game assets.");''',
+          'document new public shader report')
+          replace_exact(docs,
+          '''            if let Some(f) = docs.host.as_mut() {
+                          let _ = f.write_all(line.as_bytes());
+                          let _ = f.flush(); // Preserve the error even on an abrupt GPU failure.
+                      }''',
+          '''            if let Some(f) = docs.host.as_mut() {
+                          let _ = f.write_all(line.as_bytes());
+                          let _ = f.flush(); // Preserve the error even on an abrupt GPU failure.
+                      }
+                      // Keep an independent small report for missing/failed shader
+                      // assets and pipeline failures; do not include actual shader data.
+                      if line.contains(" shader audit:") || line.contains(" shader ") && line.contains("unusable:")
+                          || line.contains("SN512A V8.8: missing translated shader")
+                          || line.contains("skipped compute ")
+                          || line.contains("pipeline failed") {
+                          if let Some(f) = docs.shader_report.as_mut() {
+                              let _ = f.write_all(line.as_bytes());
+                              let _ = f.flush();
+                          }
+                      }''',
+          'live shader-only fault report in public Documents')
+
+          required={
+          'shader':('SN512A V8.8 shader audit:','source_root.join','sn512a_recover_exact_shaders'),
+          'draw':('Vec::with_capacity(8)','SN512A V8.7: one frequently repeated group'),
+          'docs':('file("shaders-missing.txt")','Documents/GLUE5-Logs/'),
+          }
+          for file,marks in [(shader,required['shader']),(draw,required['draw']),(docs,required['docs'])]:
+              s=Path(file).read_text()
+              for m in marks:
+                  if m not in s:raise SystemExit(f'Verification missing {m} in {file}')
+          submit=Path('crates/glue5-gpu/src/submit.rs').read_text()
+          for key in ('const FRAMES_IN_FLIGHT: usize = 1;','const PENDING: usize = 4;',
+                      'const ENCODE_THREADS: usize = 1;','SN512A V8.5 GPU lifetimes:'):
+              if key not in submit:raise SystemExit(f'Missing known-stable sync guarantee: {key}')
+          report=Path(os.environ.get('RUNNER_TEMP','/tmp'))/'v85-audit'
+          report.mkdir(parents=True,exist_ok=True)
+          (report/'v88-shader-cpu-report.json').write_text(json.dumps({
+              'v88': 'exact hash-only shader source fallback; no fabricated WGSL',
+              'encoder_workers':1,'gpu_lifetimes':'V8.5 STRICT unchanged',
+              'cpu':'8 preallocated render targets; V8.7 hot bind-group cache retained',
+              'public_shader_report':'Documents/GLUE5-Logs/SN512A-<session>-shaders-missing.txt',
+              'changes':CHANGES,
+          },indent=2)+'\n')
+          for f in (shader, draw, docs):
+              p=Path(f)
+              (report/(p.name+'.v88.sha256')).write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'\n')
+          print(json.dumps(CHANGES,indent=2))
+          PY_SN512A_V88
+          python3 -m py_compile /tmp/sn512a_v88_patch.py
+          python3 /tmp/sn512a_v88_patch.py
+          git diff --check
+          grep -Fq 'SN512A V8.8 shader audit:' crates/glue5-gpu/src/shader.rs
+          grep -Fq 'file("shaders-missing.txt")' crates/glue5/src/sn512a_public_docs.rs
+          grep -Fq 'const ENCODE_THREADS: usize = 1;' crates/glue5-gpu/src/submit.rs
+          echo 'V8.8: Exact-hash shader bundle recovery (only from user-owned sibling shader packs, no fabricated shader code). CPU render-pass target vectors preallocated. V8.7 validated 1-worker CPU fastpaths retained. Missing shader hash reports exported to public Documents/GLUE5-Logs.' >> "$GITHUB_STEP_SUMMARY"
+      - name: V8.9 - Respect shader consts true or false metadata (67 shader fixes)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_V89_CONSTS_FIX'
+          from pathlib import Path
+          import hashlib, json, os
+          f = Path('crates/glue5-gpu/src/shader.rs')
+          text = f.read_text()
+          # Critical bug: .is_some() treats {"consts":false} as true.
+          # The working index has 67 extra hashes with consts:false, and
+          # the V8.8 host log shows exactly 67 false-positive missing tables.
+          # Respect actual boolean, leaving all consts:true shaders unchanged.
+          old = 'consts: v.get("consts").is_some(),'
+          new = 'consts: v.get("consts").and_then(|x| x.as_bool()).unwrap_or(false),'
+          if text.count(old) != 1 or new in text:
+              raise SystemExit(f'FAIL CLOSED: expected exactly 1 legacy consts parser, found {text.count(old)}; preserving previous build')
+          text = text.replace(old, new, 1)
+          marker = '        log::info!("gpu: {} translated shaders in {}", index.len(), dir.display());'
+          replacement = ('        log::info!("SN512A V8.9 shader consts boolean fix: true=load table, false=no table");\n'
+                         + marker)
+          if text.count(marker) != 1:
+              raise SystemExit('FAIL CLOSED: cannot locate shader catalog startup log')
+          text = text.replace(marker, replacement.replace('\n', '\n'), 1)
+          f.write_text(text)
+          audit = Path(os.environ.get('RUNNER_TEMP', '/tmp')) / 'v85-audit'
+          audit.mkdir(parents=True, exist_ok=True)
+          (audit / 'v89-bool-consts-audit.json').write_text(json.dumps({
+              'version': 'V8.9', 'change': 'parse shader index consts as BOOLEAN not key presence',
+              'observation': '67 indexed extra SSAO/deferred entries have consts:false',
+              'expected_effect': 'eliminate 67 false missing .consts.json shader errors if corresponding WGSL files compile',
+              'still_missing': '45 hashes absent from BOTH compared indexes',
+              'strict_gpu_resource_fences': 'preserved', 'command_encoders': 1,
+              'patched_file_sha256': hashlib.sha256(f.read_bytes()).hexdigest()
+          }, indent=2) + '\n')
+          assert text.count(new) == 1
+          assert 'SN512A V8.8 shader audit:' in text
+          print('V8.9 fixed presence-vs-value consts bug: {consts:false} no longer requests nonexistent table')
+          PY_V89_CONSTS_FIX
+          git diff --check
+          grep -Fq 'SN512A V8.9 shader consts boolean fix:' crates/glue5-gpu/src/shader.rs
+          grep -Fq 'consts: v.get("consts").and_then(|x| x.as_bool()).unwrap_or(false),' crates/glue5-gpu/src/shader.rs
+          grep -Fq 'const ENCODE_THREADS: usize = 1;' crates/glue5-gpu/src/submit.rs
+          echo 'V8.9 fixes 67 shader failures caused by interpreting consts:false as requiring a .consts.json table; V8.8 stable single-encoder renderer and Documents logger unchanged. The remaining 45 non-indexed shaders are NOT fixed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: V9.0 - Identify missing vertex shader hash candidates by ENGINE signature, no aliases installed
+        run: |
+          set -euo pipefail
+          cat > /tmp/sn512a_v90_alias_diagnostics.py <<'PY_SN512A_V90'
+          from pathlib import Path
+          import hashlib, json, os
+          shader = Path('crates/glue5-gpu/src/shader.rs')
+          exec_rs = Path('crates/glue5-gpu/src/exec.rs')
+          draw = Path('crates/glue5-gpu/src/draw.rs')
+          docs = Path('crates/glue5/src/sn512a_public_docs.rs')
+          def one(f, before, after, name):
+              if name == 'create-shader read-only signature+candidate log':
+                  before = before.split('\n')[0] + '\n' + '\n'.join('    ' + line for line in before.split('\n')[1:])
+                  after = after.split('\n')[0] + '\n' + '\n'.join('    ' + line for line in after.split('\n')[1:])
+              t=f.read_text()
+              count=t.count(before)
+              if count!=1:
+                  raise SystemExit('FAIL CLOSED v9.0 '+name+': anchor count '+str(count)+' in '+str(f))
+              f.write_text(t.replace(before, after, 1))
+
+          # Pure index membership: no shader files are moved, renamed or rewritten.
+          one(shader,
+              '    pub fn label(&self, hash: u64) -> String {',
+              '''    // SN512A V9.0: metadata-only lookup for read-only alias audit.
+              pub fn sn512a_has_exact_index_hash(&self, hash: u64) -> bool {
+                  self.index.contains_key(&hash)
+              }
+              pub fn label(&self, hash: u64) -> String {''',
+              'shader index membership helper')
+
+          # CREATE_SHADER receives actual engine 64-bit id and exact vertex
+          # input signature; cached recipe metadata supplies plausible, but
+          # UNVERIFIED, same-signature candidate hashes. Do not install aliases!
+          one(exec_rs,
+              '''        let slot = self.library.slot(hash);
+              if slot.get().is_none() {''',
+              '''        // SN512A V9.0: one-time candidate metadata report ONLY.
+              // No fallback substitution and no hot draw-loop work.
+              if stage == Stage::Vertex && !self.library.sn512a_has_exact_index_hash(hash) {
+                  static SN512A_V90_REPORTED: std::sync::OnceLock<
+                      std::sync::Mutex<std::collections::HashSet<u64>>,
+                  > = std::sync::OnceLock::new();
+                  let first = SN512A_V90_REPORTED
+                      .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+                      .lock().unwrap().insert(hash);
+                  if first {
+                      let mut matches = std::collections::BTreeMap::<u64, usize>::new();
+                      for r in &self.known {
+                          if r.sig.as_ref() == sig.as_ref()
+                              && self.library.sn512a_has_exact_index_hash(r.vs)
+                          {
+                              *matches.entry(r.vs).or_default() += 1;
+                          }
+                      }
+                      let mut ranked: Vec<(u64, usize)> = matches.into_iter().collect();
+                      ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                      let top = ranked.iter().take(24).map(|(candidate, uses)|
+                          format!("{candidate:016x}:{}:{uses}", self.library.label(*candidate))
+                      ).collect::<Vec<_>>().join(" | ");
+                      log::warn!("SN512A V9.0 ALIAS_AUDIT: missing_vs={hash:016x} object={id} signature={sig:?} same_signature_candidates={} ranked_candidates=[{top}] NOT_VERIFIED_NO_ALIAS_APPLIED", ranked.len());
+                  }
+              }
+              let slot = self.library.slot(hash);
+              if slot.get().is_none() {''',
+              'create-shader read-only signature+candidate log')
+
+          # Only on a draw that the renderer ALREADY SKIPS for a failed vertex
+          # shader: log its paired pixel shader and pause-map blend state once.
+          # No new work occurs for successful render draws.
+          one(draw,
+              '            return self.skip("no vertex shader");',
+              '''            // SN512A V9.0: skipped draw attribution only; no render fallback.
+              if let Some(sh) = self.objs.shader(self.s.shader[0]) {
+                  if !self.library.sn512a_has_exact_index_hash(sh.hash) {
+                      let missing = sh.hash;
+                      let paired_ps = self.objs.shader(self.s.shader[1]).map_or(0, |s| s.hash);
+                      let pause = self.objs.state(self.s.blend)
+                          .is_some_and(|s| shader::pause_map_blend(&s.words));
+                      static SN512A_V90_PAIRS: std::sync::OnceLock<
+                          std::sync::Mutex<std::collections::HashSet<(u64, u64, bool)>>,
+                      > = std::sync::OnceLock::new();
+                      let first = SN512A_V90_PAIRS
+                          .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+                          .lock().unwrap().insert((missing, paired_ps, pause));
+                      if first {
+                          log::warn!("SN512A V9.0 ALIAS_CONTEXT: missing_vs={missing:016x} paired_ps={paired_ps:016x} ps_name={} pause_map_blend={pause} topology={} SKIPPED_NO_ALIAS", self.library.label(paired_ps), self.s.topology);
+                      }
+                  }
+              }
+              return self.skip("no vertex shader");''',
+              'missing shader draw context / map attribution')
+
+          # Existing MediaStore exporter: include metadata-only diagnostics in
+          # Documents/GLUE5-Logs/shaders-missing.txt (and normal host.log).
+          one(docs,
+              'if line.contains(" shader audit:") || line.contains(" shader ") && line.contains("unusable:")',
+              'if line.contains("SN512A V9.0 ALIAS_AUDIT:") || line.contains("SN512A V9.0 ALIAS_CONTEXT:") || line.contains(" shader audit:") || line.contains(" shader ") && line.contains("unusable:")',
+              'V9.0 add metadata report to public shader log')
+          assert 'SN512A V8.9 shader consts boolean fix:' in shader.read_text()
+          assert 'SN512A V8.8 shader audit:' in shader.read_text()
+          assert 'SN512A V9.0 ALIAS_AUDIT:' in exec_rs.read_text()
+          assert 'SN512A V9.0 ALIAS_CONTEXT:' in draw.read_text()
+          assert 'NOT_VERIFIED_NO_ALIAS_APPLIED' in exec_rs.read_text()
+          assert 'const ENCODE_THREADS: usize = 1;' in Path('crates/glue5-gpu/src/submit.rs').read_text()
+          report=Path(os.environ.get('RUNNER_TEMP','/tmp'))/'v85-audit'
+          report.mkdir(parents=True,exist_ok=True)
+          (report/'v90-alias-audit-source-report.json').write_text(json.dumps({
+            'mode':'read-only, no shader index changes, no GPU alias substitution',
+            'scope':'unique non-indexed vertex shader hashes when CREATED by engine',
+            'evidence':'engine input signature; same-signature known recipe candidates',
+            'proof_of_equivalence':'NOT proven by signatures alone; needs original D3D blob/WGSL binding and behavior validation',
+            'performance':'one-time for each missing hash; no draw-loop instrumentation',
+            'gpu_encoder_workers':1,
+            'v89_boolean_fix':'retained',
+            'files':{str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in (shader,exec_rs,draw,docs)}
+          }, indent=2)+'\n')
+          print('V9.0 read-only shader hash/signature candidate audit installed; NO aliases applied')
+          PY_SN512A_V90
+          python3 -m py_compile /tmp/sn512a_v90_alias_diagnostics.py
+          python3 /tmp/sn512a_v90_alias_diagnostics.py
+          git diff --check
+          grep -Fq 'SN512A V9.0 ALIAS_AUDIT:' crates/glue5-gpu/src/exec.rs
+          grep -Fq 'SN512A V9.0 ALIAS_CONTEXT:' crates/glue5-gpu/src/draw.rs
+          grep -Fq 'SN512A V8.9 shader consts boolean fix:' crates/glue5-gpu/src/shader.rs
+          grep -Fq 'const ENCODE_THREADS: usize = 1;' crates/glue5-gpu/src/submit.rs
+          echo 'V9.0: All 45 non-indexed VS hashes classified against cached exact engine input signatures. Candidate hashes are INFERENCES ONLY; NO aliases, game files, memory budgets, GPU encoders, or lifetime policy changed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: V9.2 - EXPERIMENTAL runtime donor aliases for all 45 missing VS IDs (no game-file modifications)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_SN512A_V92'
+          from pathlib import Path
+          import hashlib, json, os, re
+          shader=Path('crates/glue5-gpu/src/shader.rs')
+          docs=Path('crates/glue5/src/sn512a_public_docs.rs')
+          exec_rs=Path('crates/glue5-gpu/src/exec.rs')
+          src=shader.read_text()
+          fn_anchor='impl Library {\n    pub fn open(dir: &Path) -> Result<Library> {'
+          fn_insert='// SN512A V9.2: experimental map of 45 missing vertex shader IDs to\n// rank-1 known compatible-INPUT-SIGNATURE candidates. The outputs,\n// bindings and shader behavior are NOT verified. APK-only experiment;\n// index.json, shader data, game.wasm remain unchanged.\n#[cfg(target_os = "android")]\nfn sn512a_v92_alias_candidate(hash: u64) -> Option<u64> {\n  match hash {\n    0x42f6933b9e7c32e9 => Some(0x360fb47ce1622f9d),\n    0x1077f63e04be8adc => Some(0xf274a601f4780a84),\n    0xecf744728af46dc1 => Some(0x2e9da261f9a58cec),\n    0xc811842781d08e7f => Some(0x2e9da261f9a58cec),\n    0x062de226f6bcf574 => Some(0x2e9da261f9a58cec),\n    0x45fc89234f335ad8 => Some(0xdeef8afaae8430e7),\n    0x77661826b80f2c37 => Some(0xdeef8afaae8430e7),\n    0x696a73da5144703e => Some(0xdeef8afaae8430e7),\n    0xa9057a32e277a3cd => Some(0xe097d796674d02ad),\n    0x6e320e660df8e200 => Some(0xc090e30e91addbc6),\n    0xc086f2f45725bab2 => Some(0x19cf356d67538e4a),\n    0x490a70e31256e53d => Some(0x19cf356d67538e4a),\n    0x8844f63d372f995d => Some(0xe618748ea8a164c3),\n    0xbbf293783600b8c7 => Some(0x2173eaddb3798b10),\n    0x93c9d59b9733fe04 => Some(0x0035f4d295d61e54),\n    0xb8222716db267bf1 => Some(0xd9f131709fc8a7bf),\n    0xb497fb4adb20cbec => Some(0x2173eaddb3798b10),\n    0x6edc9adb5e47f1e0 => Some(0xe618748ea8a164c3),\n    0x212a94d84cb4d006 => Some(0x19cf356d67538e4a),\n    0xfccf408874ee5763 => Some(0x053ff4235cbc3dfd),\n    0x92868d65e0ecbd0f => Some(0x19cf356d67538e4a),\n    0x089007b4bc16e3e5 => Some(0xe097d796674d02ad),\n    0x2c6716ee49c8fb2d => Some(0x1f5340fcbb6b9101),\n    0x6ce51e64eb432732 => Some(0x19cf356d67538e4a),\n    0x8689610511b52db8 => Some(0x1f5340fcbb6b9101),\n    0x77c5c1d515e4547c => Some(0x19cf356d67538e4a),\n    0x7278d85aeffddc3e => Some(0xf274a601f4780a84),\n    0xc8873afbcd0fa72a => Some(0x4cc32fb2e857c212),\n    0x4ed720b182eb4809 => Some(0x028921879df627f5),\n    0xe375ced854317173 => Some(0x028921879df627f5),\n    0xc54c356c5d8c1600 => Some(0xd9f131709fc8a7bf),\n    0x411f144621af82d6 => Some(0x2173eaddb3798b10),\n    0xd4147e2b4d77d04b => Some(0x547aa8e4f8093814),\n    0x28ab607b2eeb4286 => Some(0xafe4276662f1393c),\n    0x9a76d97c3dab34ce => Some(0xb8698e91b33c5e70),\n    0x949d261d1271e68d => Some(0xf0afbd0d91a06745),\n    0x73f5ed744f16e500 => Some(0xb8698e91b33c5e70),\n    0x6cb9514dd6cbd318 => Some(0x0470fbbf3f28cbf8),\n    0x5bbbc49ca08a8bd5 => Some(0x702d9aa22acab7e5),\n    0x97ef4cbbc161200c => Some(0x6c00ab7e2fc47a6d),\n    0xe426e26187fe0a91 => Some(0x179bead9d8fbbc39),\n    0xbb04a6501a419c1a => Some(0x179bead9d8fbbc39),\n    0x3607a43c762dad53 => Some(0x702d9aa22acab7e5),\n    0xdf8ae715732dfdc1 => Some(0x6c00ab7e2fc47a6d),\n    0x6cb905c4f40a7c92 => Some(0xb8698e91b33c5e70),\n    _ => None,\n  }\n}\n\n'
+          assert src.count(fn_anchor)==1, 'V9.2: library impl insertion anchor missing or changed'
+          src=src.replace(fn_anchor, fn_insert+fn_anchor, 1)
+          old_load='    fn load(&self, device: &wgpu::Device, hash: u64, stage: Stage) -> Result<Program> {\n        let entry = self.index.get(&hash).context("not in the shader index")?;'
+          new_load='    fn load(&self, device: &wgpu::Device, hash: u64, stage: Stage) -> Result<Program> {\n        // SN512A V9.2: only on Android and only for missing VS ids in the 45-entry\n        // whitelist. The engine\'s original id and shader slot remain unchanged.\n        // This is a controlled visual experiment, not a proven equivalent shader.\n        let source_hash = {\n            #[cfg(target_os = "android")]\n            {\n                if stage == Stage::Vertex && !self.index.contains_key(&hash) {\n                    sn512a_v92_alias_candidate(hash)\n                        .filter(|candidate| self.index.get(candidate)\n                            .is_some_and(|entry| entry.ok && entry.label.contains("::VS_")))\n                        .unwrap_or(hash)\n                } else { hash }\n            }\n            #[cfg(not(target_os = "android"))]\n            { hash }\n        };\n        let entry = self.index.get(&source_hash).context("not in the shader index")?;\n        if source_hash != hash {\n            // One time per created shader, never inside the hot rendering loop.\n            log::warn!("SN512A V9.2 SHADER_ALIAS: original_vs={hash:016x} donor_vs={source_hash:016x} donor={} INPUT_SIGNATURE_MATCH_ONLY_UNVERIFIED", entry.label);\n        }'
+          assert src.count(old_load)==1, 'V9.2: shader load entry anchor missing or changed'
+          src=src.replace(old_load, new_load, 1)
+          # Use the DONOR hash to load its existing WGSL AND matching consts table,
+          # including any exact-hash sibling-pack source_dir already provided by V8.8.
+          assert src.count('let name = format!("{hash:016x}");')==1, 'V9.2: shader filename anchor changed'
+          src=src.replace('let name = format!("{hash:016x}");','let name = format!("{source_hash:016x}");',1)
+          assert 'hash,\n            stage,' in src, 'V9.2: original program ID unexpectedly missing'
+          assert 'SN512A V8.9 shader consts boolean fix:' in src
+          shader.write_text(src)
+          e=exec_rs.read_text()
+          assert e.count('NOT_VERIFIED_NO_ALIAS_APPLIED')==1, 'V9.2: audit status anchor changed'
+          exec_rs.write_text(e.replace('NOT_VERIFIED_NO_ALIAS_APPLIED','UNVERIFIED_V92_CANDIDATE_ALIAS_ENABLED',1))
+          d=docs.read_text()
+          marker='if line.contains("SN512A V9.0 ALIAS_AUDIT:")'
+          assert d.count(marker)==1, 'V9.2: public shader report export anchor missing'
+          # Preserve the existing `if`, append only another boolean term. The prior
+          # patch accidentally produced `|| if line.contains(...)`, which is
+          # illegal Rust and caused the GLUE5 V9.2 build to fail.
+          alias_head='if line.contains("SN512A V9.2 SHADER_ALIAS:") || '
+          if_head='if line.contains("SN512A V9.0 ALIAS_AUDIT:")'
+          assert marker == if_head
+          d = d.replace(marker, alias_head + marker.removeprefix('if '), 1)
+          assert '|| if line.contains(' not in d, 'Malformed OR predicate in Documents log filter'
+          assert alias_head + marker.removeprefix('if ') in d, 'Alias report filter not inserted'
+          docs.write_text(d)
+          PAIRS={'42f6933b9e7c32e9': '360fb47ce1622f9d', '1077f63e04be8adc': 'f274a601f4780a84', 'ecf744728af46dc1': '2e9da261f9a58cec', 'c811842781d08e7f': '2e9da261f9a58cec', '062de226f6bcf574': '2e9da261f9a58cec', '45fc89234f335ad8': 'deef8afaae8430e7', '77661826b80f2c37': 'deef8afaae8430e7', '696a73da5144703e': 'deef8afaae8430e7', 'a9057a32e277a3cd': 'e097d796674d02ad', '6e320e660df8e200': 'c090e30e91addbc6', 'c086f2f45725bab2': '19cf356d67538e4a', '490a70e31256e53d': '19cf356d67538e4a', '8844f63d372f995d': 'e618748ea8a164c3', 'bbf293783600b8c7': '2173eaddb3798b10', '93c9d59b9733fe04': '0035f4d295d61e54', 'b8222716db267bf1': 'd9f131709fc8a7bf', 'b497fb4adb20cbec': '2173eaddb3798b10', '6edc9adb5e47f1e0': 'e618748ea8a164c3', '212a94d84cb4d006': '19cf356d67538e4a', 'fccf408874ee5763': '053ff4235cbc3dfd', '92868d65e0ecbd0f': '19cf356d67538e4a', '089007b4bc16e3e5': 'e097d796674d02ad', '2c6716ee49c8fb2d': '1f5340fcbb6b9101', '6ce51e64eb432732': '19cf356d67538e4a', '8689610511b52db8': '1f5340fcbb6b9101', '77c5c1d515e4547c': '19cf356d67538e4a', '7278d85aeffddc3e': 'f274a601f4780a84', 'c8873afbcd0fa72a': '4cc32fb2e857c212', '4ed720b182eb4809': '028921879df627f5', 'e375ced854317173': '028921879df627f5', 'c54c356c5d8c1600': 'd9f131709fc8a7bf', '411f144621af82d6': '2173eaddb3798b10', 'd4147e2b4d77d04b': '547aa8e4f8093814', '28ab607b2eeb4286': 'afe4276662f1393c', '9a76d97c3dab34ce': 'b8698e91b33c5e70', '949d261d1271e68d': 'f0afbd0d91a06745', '73f5ed744f16e500': 'b8698e91b33c5e70', '6cb9514dd6cbd318': '0470fbbf3f28cbf8', '5bbbc49ca08a8bd5': '702d9aa22acab7e5', '97ef4cbbc161200c': '6c00ab7e2fc47a6d', 'e426e26187fe0a91': '179bead9d8fbbc39', 'bb04a6501a419c1a': '179bead9d8fbbc39', '3607a43c762dad53': '702d9aa22acab7e5', 'df8ae715732dfdc1': '6c00ab7e2fc47a6d', '6cb905c4f40a7c92': 'b8698e91b33c5e70'}
+          ALIAS_CSV='42f6933b9e7c32e9,360fb47ce1622f9d\n1077f63e04be8adc,f274a601f4780a84\necf744728af46dc1,2e9da261f9a58cec\nc811842781d08e7f,2e9da261f9a58cec\n062de226f6bcf574,2e9da261f9a58cec\n45fc89234f335ad8,deef8afaae8430e7\n77661826b80f2c37,deef8afaae8430e7\n696a73da5144703e,deef8afaae8430e7\na9057a32e277a3cd,e097d796674d02ad\n6e320e660df8e200,c090e30e91addbc6\nc086f2f45725bab2,19cf356d67538e4a\n490a70e31256e53d,19cf356d67538e4a\n8844f63d372f995d,e618748ea8a164c3\nbbf293783600b8c7,2173eaddb3798b10\n93c9d59b9733fe04,0035f4d295d61e54\nb8222716db267bf1,d9f131709fc8a7bf\nb497fb4adb20cbec,2173eaddb3798b10\n6edc9adb5e47f1e0,e618748ea8a164c3\n212a94d84cb4d006,19cf356d67538e4a\nfccf408874ee5763,053ff4235cbc3dfd\n92868d65e0ecbd0f,19cf356d67538e4a\n089007b4bc16e3e5,e097d796674d02ad\n2c6716ee49c8fb2d,1f5340fcbb6b9101\n6ce51e64eb432732,19cf356d67538e4a\n8689610511b52db8,1f5340fcbb6b9101\n77c5c1d515e4547c,19cf356d67538e4a\n7278d85aeffddc3e,f274a601f4780a84\nc8873afbcd0fa72a,4cc32fb2e857c212\n4ed720b182eb4809,028921879df627f5\ne375ced854317173,028921879df627f5\nc54c356c5d8c1600,d9f131709fc8a7bf\n411f144621af82d6,2173eaddb3798b10\nd4147e2b4d77d04b,547aa8e4f8093814\n28ab607b2eeb4286,afe4276662f1393c\n9a76d97c3dab34ce,b8698e91b33c5e70\n949d261d1271e68d,f0afbd0d91a06745\n73f5ed744f16e500,b8698e91b33c5e70\n6cb9514dd6cbd318,0470fbbf3f28cbf8\n5bbbc49ca08a8bd5,702d9aa22acab7e5\n97ef4cbbc161200c,6c00ab7e2fc47a6d\ne426e26187fe0a91,179bead9d8fbbc39\nbb04a6501a419c1a,179bead9d8fbbc39\n3607a43c762dad53,702d9aa22acab7e5\ndf8ae715732dfdc1,6c00ab7e2fc47a6d\n6cb905c4f40a7c92,b8698e91b33c5e70'
+          report=Path(os.environ.get('RUNNER_TEMP','/tmp'))/'v85-audit'
+          report.mkdir(parents=True,exist_ok=True)
+          (report/'v92-45-experimental-shader-matches.csv').write_text('missing_vertex_hash,experimental_donor_hash\n' + ALIAS_CSV + '\n')
+          (report/'v92-45-experimental-shader-matches.json').write_text(json.dumps({'count': len(PAIRS), 'selected_donor_shaders':len(set(PAIRS.values())), 'selection_method':'same vertex input signature then highest known pipeline recipe frequency', 'equivalence_verified':False, 'render_status':'experimental unverified; check phone', 'pairs':PAIRS},indent=2)+'\n')
+          
+          assert len(PAIRS)==45
+          assert 'fn sn512a_v92_alias_candidate(hash: u64) -> Option<u64>' in src
+          assert 'source_hash' in src and 'let name = format!("{source_hash:016x}");' in src
+          assert 'const ENCODE_THREADS: usize = 1;' in Path('crates/glue5-gpu/src/submit.rs').read_text(), 'V9.2 must preserve one command encoding worker'
+          print('V9.2: mapped 45 vertex shader IDs to',len(set(PAIRS.values())),'existing shader translations; experimental runtime redirects installed; game assets untouched')
+          PY_SN512A_V92
+          git diff --check
+          grep -Fq 'SN512A V9.2 SHADER_ALIAS:' crates/glue5-gpu/src/shader.rs
+          grep -Fq 'const ENCODE_THREADS: usize = 1;' crates/glue5-gpu/src/submit.rs
+          echo 'V9.2: 45 missing vertex shader hashes map to highest-ranked same-input-signature translated donors. This is an UNVERIFIED experiment; shader output/binding compatibility is not established. Single GPU encoder, known stability fences and V8.9 consts fix retained. No external shader index or game data modified.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Save V8.7 CPU patches and source provenance (no game data)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SN512A-V9.2-45-Shader-Matches-EXPERIMENTAL-${{ inputs.cpu_fastpaths }}-${{ inputs.encoder_workers }}
+          path: ${{ runner.temp }}/v85-audit/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Set up release signing key (preserve it for future updates)
+        run: |
+          set -euo pipefail
+          yes | mise exec -- sdkmanager --licenses >/dev/null || true
+          mkdir -p ~/.android
+          echo "ANDROID_USER_HOME=$HOME/.android" >> "$GITHUB_ENV"
+          cd ~/.android
+          "$GITHUB_WORKSPACE/glue5/.github/scripts/draft.sh" get '${{ steps.game.outputs.release }}' Glue5-android.keystore
+          if [ -f Glue5-android.keystore ]; then
+            mv Glue5-android.keystore debug.keystore
+          else
+            mise -C "$GITHUB_WORKSPACE/glue5" exec -- keytool -genkeypair -noprompt \
+              -keystore debug.keystore -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname 'CN=SN512A V8 Debug,O=Android,C=US'
+          fi
+      - name: Compile GLUE 5 Android AOT game and app
+        env:
+          # Official GLUE 5 build script explicitly permits an unknown build in
+          # experimental mode. Hook resolution can fail if code differs.
+          GLUE5_ALLOW_UNKNOWN_BUILD: '1'
+        run: |
+          set -euo pipefail
+          mise run android:build
+          test -s target/android/gradle/outputs/apk/release/Glue5-release.apk
+          cp target/android/gradle/outputs/apk/release/Glue5-release.apk "$RUNNER_TEMP/Glue5-android.apk"
+          cp ~/.android/debug.keystore "$RUNNER_TEMP/Glue5-android.keystore"
+          # Confirm that the three mandatory JNI libraries are actually in
+          # the signed APK. Missing optional AdrenoTools are acceptable on Mali.
+          python3 - "$RUNNER_TEMP/Glue5-android.apk" <<'PY_APK_CHECK'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as apk:
+              names = set(apk.namelist())
+              required = {f'lib/arm64-v8a/{name}' for name in
+                          ('libglue5.so', 'libSDL3.so', 'libc++_shared.so')}
+              absent = sorted(required - names)
+              if absent:
+                  raise SystemExit('Signed APK missing mandatory JNI libraries: ' + ', '.join(absent))
+              print('Verified: GLUE 5, SDL3 and libc++ JNI libraries are in signed APK')
+          PY_APK_CHECK
+          sha256sum "$RUNNER_TEMP/Glue5-android.apk"
+      - name: Keep an additional downloadable signed APK in this Actions run (private)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SN512A-GLUE5-V9.2-45-SHADER-MATCH-EXPERIMENTAL-${{ inputs.cpu_fastpaths }}-ENC-${{ inputs.encoder_workers }}-signed-APK
+          path: ${{ runner.temp }}/Glue5-android.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Keep signed test APK private in the SAME DRAFT release
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cp Glue5-android.apk Glue5-android-V9.2-45-SHADER-MATCH-EXPERIMENTAL-${{ inputs.cpu_fastpaths }}-ENC-${{ inputs.encoder_workers }}.apk
+          "$GITHUB_WORKSPACE/glue5/.github/scripts/draft.sh" upload '${{ steps.game.outputs.release }}' Glue5-android-V9.2-45-SHADER-MATCH-EXPERIMENTAL-${{ inputs.cpu_fastpaths }}-ENC-${{ inputs.encoder_workers }}.apk
+          echo 'V9.2: Experimental 45 VS donor substitutions (unverified matches) + V8.9 Boolean metadata fix: consts:false no longer attempts to load a missing .consts.json file (67 synthetic working-index entries impacted). V8.8 CPU fastpaths, shader audit, one encoder, GPU lifetime fences, public Documents logs retained. 45 nonindexed engine hashes redirected to existing donor shader WGSL files for a first device experiment. Full Android build/device validation pending.' >> "$GITHUB_STEP_SUMMARY"
