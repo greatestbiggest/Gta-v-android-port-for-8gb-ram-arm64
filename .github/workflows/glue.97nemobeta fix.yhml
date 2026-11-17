@@ -1,0 +1,303 @@
+# .github/workflows/glue5-gpu-optimizations.yml
+name: GLUE 5 GPU Optimizations - Mali-G57 MC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_mode:
+        description: 'GPU optimization mode'
+        required: true
+        type: choice
+        options:
+          - 'performance'      # Minimal optimization (V9.7 Performance)
+          - 'balanced'         # Balanced optimization (V9.6 R2)
+          - 'aggressive'       # Maximum optimization (V9.6 R2 + experimental)
+          - 'experimental'     # All experimental features (V9.2-9.7)
+      pool_policy:
+        description: 'Vulkan command-pool recycling policy'
+        required: true
+        type: choice
+        options:
+          - 'conservative'
+          - 'baseline'
+      sync_policy:
+        description: 'GPU resource lifetime policy'
+        required: true
+        type: choice
+        options:
+          - 'strict'
+      gpu_budget:
+        description: 'GPU soft memory budget (MiB)'
+        required: true
+        type: choice
+        options:
+          - '640'
+          - '704'
+          - '768'
+      encoder_workers:
+        description: 'Encoder worker count (1=R1, 2=R2)'
+        required: true
+        type: choice
+        options:
+          - '1'
+          - '2'
+      cpu_fastpaths:
+        description: 'Enable CPU fastpaths'
+        required: true
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+
+env:
+  GLUE5_VERSION: 'V9.7 R1'
+  BUILD_NAME: 'SN512A-Mali-G57-MC2'
+  ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '2'
+
+jobs:
+  # Phase 1: Validate and prepare build environment
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      game-hash: ${{ steps.game.outputs.sha }}
+      game-bytes: ${{ steps.game.outputs.size }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+
+      - name: Verify game.wasm from private draft
+        id: game
+        run: |
+          set -euo pipefail
+          
+          # Validate exact game.wasm specifications
+          EXPECTED_SHA="dcd3dc966ae8ab78637137580da990f9acec2ecfba6c47d153bdc15e4b60ca02"
+          EXPECTED_BYTES="63202762"
+          
+          GAME_DIR="${{ runner.temp }}/game-build"
+          GAME_WASM="${GAME_DIR}/game.wasm"
+          mkdir -p "$(dirname "$GAME_WASM")"
+          
+          # Find latest private draft with uploaded game.wasm
+          RELEASE_ID=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" | \
+            jq -r '[.[][] | select(.draft == true) | select(any(.assets[]?; .name == "game.wasm" and .state == "uploaded"))] | sort_by(.created_at) | last | .id')
+          
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+            echo "ERROR: No private draft release with uploaded game.wasm"
+            exit 1
+          fi
+          
+          # Download the exact game.wasm
+          curl --fail --show-error --silent --location \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H 'Accept: application/octet-stream' \
+            -o "$GAME_WASM" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$RELEASE_ID?game.wasm"
+          
+          ACTUAL_BYTES=$(wc -c < "$GAME_WASM" | tr -d ' ')
+          ACTUAL_SHA=$(sha256sum "$GAME_WASM" | cut -d' ' -f1)
+          
+          echo "Uploaded file: ${ACTUAL_BYTES} bytes, ${ACTUAL_SHA}"
+          echo "Expected: ${EXPECTED_BYTES} bytes, ${EXPECTED_SHA}"
+          
+          if [ "$ACTUAL_BYTES" != "$EXPECTED_BYTES" ] || [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "ERROR: This is not the previously observed alternate game.wasm"
+            exit 1
+          fi
+          
+          # Validate WASM header
+          python3 -c "
+          import sys
+          with open(sys.argv[1], 'rb') as f:
+              header = f.read(8)
+          if header != b'\\x00asm\\x01\\x00\\x00\\x00':
+              raise SystemExit('Invalid WASM v1 binary header')
+          " "$GAME_WASM"
+          
+          echo "game-hash=${ACTUAL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "game-bytes=${ACTUAL_BYTES}" >> "$GITHUB_OUTPUT"
+          
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+
+      - name: Cache Rust toolchain and dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: |
+            rust-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+            ${{ steps.game.outputs.sha }}
+
+      - name: Cache Android SDK/NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ANDROID_SDK_ROOT }}
+            ~/.android
+          key: |
+            android-v2-${{ runner.os }}-sdk-ndk-${{ hashFiles('*.yml', '*.yaml') }}
+            ${{ steps.game.outputs.sha }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            libasound2-dev \
+            libudev-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Setup MISE (Rust/Android toolchain manager)
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca
+        with:
+          version: 2026.7.5
+          install: false
+          cache_key_prefix: glue5-aot-build-${{ steps.game.outputs.sha }}
+
+      - name: Install Android SDK/NDK via MISE
+        run: mise install android-sdk ndk android-emulator
+
+  # Phase 2: Apply GPU optimization patches based on configuration
+  apply-patches:
+    runs-on: ubuntu-24.04
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - mode: performance    # Minimal optimization
+            v9_patches: '9.7'
+            v8_patches: '8.7'     # Base validation
+            gpu_threads: 1
+            cpu_fastpaths: 'yes'
+            description: 'Performance Edition (Minimal Optimizations)'
+            
+          - mode: balanced       # Standard optimization
+            v9_patches: '9.6'
+            v8_patches: '8.7'
+            gpu_threads: 1
+            cpu_fastpaths: 'yes'
+            description: 'Balanced Edition (Standard Optimizations)'
+            
+          - mode: aggressive     # Advanced optimization
+            v9_patches: '9.6'
+            v8_patches: '8.7'
+            gpu_threads: 1
+            cpu_fastpaths: 'yes'
+            description: 'Aggressive Edition (Advanced Optimizations)'
+            
+          - mode: experimental   # Maximum optimization
+            v9_patches: '9.7'
+            v8_patches: '8.7'
+            gpu_threads: 2
+            cpu_fastpaths: 'yes'
+            description: 'Experimental Edition (All Optimizations)'
+    
+    steps:
+      - name: Checkout GLUE 5 source
+        uses: actions/checkout@v4
+        with:
+          repository: mempage4k/glue5
+          ref: main
+          path: glue5
+          fetch-depth: 1
+
+      - name: Apply version-specific optimization patches
+        run: |
+          set -euo pipefail
+          cd glue5
+          
+          # Create patch directory
+          mkdir -p patches/
+          
+          # V9.x base optimizations (apply all V9 versions)
+          case "${{ matrix.v9_patches }}" in
+            '9.7')
+              echo "Applying V9.7 Performance Edition patches..."
+              # V9.6 R1 + V9.5 + V9.4 (excluded) + V9.3 + V9.2 base
+              ${{ github.workspace }}/repo/.github/scripts/apply_v9_patches.sh
+              ;;
+            '9.6')
+              echo "Applying V9.6 + V9.5 patches..."
+              ${{ github.workspace }}/repo/.github/scripts/apply_v9_patches.sh 9.6
+              ;;
+          esac
+          
+          # V8.x base optimizations (always V8.7 for stability)
+          echo "Applying V8.7 + V8.6 base patches..."
+          ${{ github.workspace }}/repo/.github/scripts/apply_v8_patches.sh
+          
+          # Apply mode-specific customizations
+          case "${{ matrix.mode }}" in
+            'performance')
+              echo "Applying performance-optimized settings..."
+              ${{ github.workspace }}/repo/.github/scripts/apply_performance_settings.sh
+              ;;
+            'balanced')
+              echo "Applying balanced settings..."
+              ${{ github.workspace }}/repo/.github/scripts/apply_balanced_settings.sh
+              ;;
+            'aggressive')
+              echo "Applying aggressive settings..."
+              ${{ github.workspace }}/repo/.github/scripts/apply_aggressive_settings.sh
+              ;;
+            'experimental')
+              echo "Applying experimental settings..."
+              ${{ github.workspace }}/repo/.github/scripts/apply_experimental_settings.sh
+              ;;
+          esac
+          
+          # Apply user-selected configuration overrides
+          echo "Applying user configuration: ${{ github.event.inputs.* }}"
+          ${{ github.workspace }}/repo/.github/scripts/apply_user_config.sh
+      
+      - name: Validate optimization stack
+        run: |
+          cd glue5
+          mise run validate-all
+          
+          # Verify critical invariants
+          python3 <<'PY'
+          import json
+          import subprocess
+          import os
+          
+          # Check for critical patches
+          required_patches = [
+              'V9.7' if '${{ matrix.mode }}' == 'experimental' else 'V9.6',
+              'V9.5',
+              'V9.3',
+              'V9.2',
+              'V8.7'
+          ]
+          
+          # Verify shader compatibility
+          shader_file = 'crates/glue5-gpu/src/shader.rs'
+          if not os.path.exists(shader_file):
+              raise SystemExit(f'Missing shader file: {shader_file}')
+          
+          with open(shader_file, 'r') as f:
+              content = f.read()
+          \u00a0
+          # Check for bind cache\n          if 'hot: [[Option<(Box<[u32]>, wgpu::BindGroup, u64)>; 2]; 3]' not in content:\n              raise SystemExit('Two-way bind cache not found')\n          \u00a0\n          # Check for upload worker\n          submit_file = 'crates/glue5-gpu/src/submit.rs'\n          if not os.path.exists(submit_file):\n              raise SystemExit(f'Missing submit file: {submit_file}')\n          \n          with open(submit_file, 'r') as f:\n              submit_content = f.read()\n          \u00a0\n          if 'SN512A V9.3 DEDICATED_UPLOAD_FINISH:' not in submit_content:\n              raise SystemExit('Dedicated upload worker not configured')\n          \u00a0\n          print('✅ All optimization invariants verified')\n          PY
+      
+      - name: Cache patched source
+        uses: actions/cache@v4
+        with:\n          path: |\n            glue5/\n            target/\n          key: |\n            glue5-patched-v${{ matrix.v9_patches }}-${{ matrix.mode }}-${{ needs.validate.outputs.game-hash }}-${{ inputs.pool_policy }}-${{ inputs.sync_policy }}-${{ inputs.gpu_budget }}-${{ inputs.encoder_workers }}-${{ inputs.cpu_fastpaths }}\n            glue5-patched-base-\n      
+      - name: Save optimization configuration
+        run: |
+          mkdir -p ${{ runner.temp }}/build-config
+          cat > ${{ runner.temp }}/build-config/metadata.json <<EOF\n{\n  \"mode\": \"${{ matrix.mode }}\",\n  \"description\": \"${{ matrix.description }}\",\n  \"v9_patches\": \"${{ matrix.v9_patches }}\",\n  \"v8_patches\": \"${{ matrix.v8_patches }}\",\n  \"gpu_threads\": ${{ matrix.gpu_threads }},\n  \"cpu_fastpaths\": \"${{ matrix.cpu_fastpaths }}\",\n  \"gpu_mode\": \"${{ github.event.inputs.gpu_mode }}\",\n  \"pool_policy\": \"${{ github.event.inputs.pool_policy }}\",\n  \"sync_policy\": \"${{ github.event.inputs.sync_policy }}\",\n  \"gpu_budget\": \"${{ github.event.inputs.gpu_budget }}\",\n  \"encoder_workers\": \"${{ github.event.inputs.encoder_workers }}\",\n  \"cpu_fastpaths\": \"${{ github.event.inputs.cpu_fastpaths }}\",\n  \"game_hash\": \"${{ needs.validate.outputs.game-hash }}\",\n  \"game_bytes\": \"${{ needs.validate.outputs.game-bytes }}\",\n  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n}\nEOF\n          echo \"Build configuration saved to ${{ runner.temp }}/build-config/metadata.json\"\n      
+      - name: Upload optimization config\n\n```
+      
